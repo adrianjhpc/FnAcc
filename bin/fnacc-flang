@@ -6,40 +6,40 @@ usage() {
 Usage:
   fnacc-flang --kernel-src KERNEL.f90 --main-src MAIN.f90 -o EXE [options]
 
-Options:
-  --kernel-src FILE       Fortran source containing FNACC subroutine(s)
-  --main-src FILE         Fortran main program source
-  -o, --output EXE        Output executable name
+Required:
+  --kernel-src FILE        Fortran source containing FNACC kernel/module code
+  --main-src FILE          Fortran main/support source. May be repeated.
+  -o, --output EXE         Output executable
 
-  --base NAME             Base name for intermediate files
-  --workdir DIR           Directory for intermediate files
-  --sm NUM                CUDA SM version, e.g. 80, 90
+Options:
+  --extra-src FILE         Additional non-FNACC Fortran source. May be repeated.
+  --base NAME              Base name for intermediate files
+  --workdir DIR            Directory for intermediate files
+  --sm NUM                 CUDA SM version, e.g. 80, 90
+  -I DIR                   Add Fortran include/module search directory
+  -J DIR                   Add Fortran module output/search directory
+  --fflag FLAG             Extra flag passed to flang-new compile steps. May repeat.
+  --ldflag FLAG            Extra linker flag. May repeat.
+  --lib LIB                Extra library, e.g. --lib m means -lm. May repeat.
   --keep                  Keep intermediate files
   --verbose               Print commands before running them
+  --dry-run               Print commands but do not run them
   -h, --help              Show this help
 
-Environment variables:
-  LLVM_BUILD              Path to llvm-project build directory
-  TRITON_OPT              Path to triton-opt
-  MLIR_TRANSLATE          Path to mlir-translate from Triton LLVM
-  LLC                     Path to llc from Triton LLVM
-  CUDA_LIB_DIR            Path to CUDA driver library directory
+Environment:
+  LLVM_BUILD               llvm-project build directory
+  TRITON_OPT               path to triton-opt
+  MLIR_TRANSLATE           path to mlir-translate
+  LLC                      path to llc
+  CUDA_LIB_DIR             CUDA library directory, default /usr/local/cuda/lib64
 
-Optional environment variables:
-  FNACC_SM                Default CUDA SM version, default 80
-  FNACC_WORKDIR           Default work directory, default current directory
-
-Example:
-  export LLVM_BUILD=/path/to/llvm-project/build
-  export TRITON_OPT=/path/to/triton/build/cmake.linux-x86_64-cpython-3.12/bin/triton-opt
-  export MLIR_TRANSLATE=/path/to/triton-llvm/build/bin/mlir-translate
-  export LLC=/path/to/triton-llvm/build/bin/llc
-  export CUDA_LIB_DIR=/usr/local/cuda/lib64
-
-  ./bin/fnacc-flang \
-    --kernel-src examples/vector-add/kernel.f90 \
-    --main-src examples/vector-add/main.f90 \
-    -o vector-add
+Optional environment:
+  FNGPU_SM / FNACC_SM      default CUDA SM, default 80
+  FNACC_WORKDIR            default work directory, default current directory
+  FLANG                    override flang-new
+  FIROPT                   override fir-opt
+  TCO                      override tco
+  CLANG                    override clang
 EOF
 }
 
@@ -52,33 +52,49 @@ log() {
   echo "[fnacc-flang] $*" >&2
 }
 
+quote_cmd() {
+  printf '+'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
 run() {
-  if [[ "${VERBOSE}" == "1" ]]; then
-    printf '+'
-    printf ' %q' "$@"
-    printf '\n'
+  if [[ "$VERBOSE" == "1" || "$DRY_RUN" == "1" ]]; then
+    quote_cmd "$@"
   fi
-  "$@"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    "$@"
+  fi
 }
 
 require_file() {
-  local path="$1"
-  [[ -f "$path" ]] || die "file not found: $path"
+  [[ -f "$1" ]] || die "file not found: $1"
 }
 
 require_exe() {
-  local path="$1"
-  [[ -x "$path" ]] || die "executable not found or not executable: $path"
+  [[ -x "$1" ]] || die "executable not found or not executable: $1"
+}
+
+abspath() {
+  python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
 KERNEL_SRC=""
-MAIN_SRC=""
+MAIN_SRCS=()
+EXTRA_SRCS=()
 EXE=""
 BASE=""
 WORKDIR="${FNACC_WORKDIR:-.}"
-SM="${FNACC_SM:-80}"
+SM="${FNACC_SM:-${FNGPU_SM:-80}}"
 KEEP=0
 VERBOSE=0
+DRY_RUN=0
+
+INCLUDE_DIRS=()
+MODULE_DIRS=()
+FFLAGS=()
+LDFLAGS=()
+LIBS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -89,7 +105,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --main-src)
       [[ $# -ge 2 ]] || die "--main-src requires an argument"
-      MAIN_SRC="$2"
+      MAIN_SRCS+=("$2")
+      shift 2
+      ;;
+    --extra-src)
+      [[ $# -ge 2 ]] || die "--extra-src requires an argument"
+      EXTRA_SRCS+=("$2")
       shift 2
       ;;
     -o|--output)
@@ -112,12 +133,41 @@ while [[ $# -gt 0 ]]; do
       SM="$2"
       shift 2
       ;;
+    -I)
+      [[ $# -ge 2 ]] || die "-I requires an argument"
+      INCLUDE_DIRS+=("$2")
+      shift 2
+      ;;
+    -J)
+      [[ $# -ge 2 ]] || die "-J requires an argument"
+      MODULE_DIRS+=("$2")
+      shift 2
+      ;;
+    --fflag)
+      [[ $# -ge 2 ]] || die "--fflag requires an argument"
+      FFLAGS+=("$2")
+      shift 2
+      ;;
+    --ldflag)
+      [[ $# -ge 2 ]] || die "--ldflag requires an argument"
+      LDFLAGS+=("$2")
+      shift 2
+      ;;
+    --lib)
+      [[ $# -ge 2 ]] || die "--lib requires an argument"
+      LIBS+=("-l$2")
+      shift 2
+      ;;
     --keep)
       KEEP=1
       shift
       ;;
     --verbose)
       VERBOSE=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
       shift
       ;;
     -h|--help)
@@ -131,11 +181,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$KERNEL_SRC" ]] || die "missing --kernel-src"
-[[ -n "$MAIN_SRC" ]] || die "missing --main-src"
+[[ ${#MAIN_SRCS[@]} -gt 0 ]] || die "missing at least one --main-src"
 [[ -n "$EXE" ]] || die "missing -o/--output"
 
 require_file "$KERNEL_SRC"
-require_file "$MAIN_SRC"
+for src in "${MAIN_SRCS[@]}"; do require_file "$src"; done
+for src in "${EXTRA_SRCS[@]}"; do require_file "$src"; done
 
 LLVM_BUILD="${LLVM_BUILD:-}"
 [[ -n "$LLVM_BUILD" ]] || die "LLVM_BUILD is not set"
@@ -165,11 +216,27 @@ require_exe "$LLC"
 mkdir -p "$WORKDIR"
 
 if [[ -z "$BASE" ]]; then
-  exe_base="$(basename "$EXE")"
-  BASE="$exe_base"
+  BASE="$(basename "$EXE")"
 fi
 
 BASE_PATH="$WORKDIR/$BASE"
+MOD_DIR="$WORKDIR/mod"
+OBJ_DIR="$WORKDIR/obj"
+
+mkdir -p "$MOD_DIR" "$OBJ_DIR"
+
+# Always include our generated module directory.
+INCLUDE_FLAGS=("-I" "$MOD_DIR")
+MODULE_FLAGS=("-J" "$MOD_DIR")
+
+for dir in "${INCLUDE_DIRS[@]}"; do
+  INCLUDE_FLAGS+=("-I" "$dir")
+done
+
+for dir in "${MODULE_DIRS[@]}"; do
+  MODULE_FLAGS+=("-J" "$dir")
+  INCLUDE_FLAGS+=("-I" "$dir")
+done
 
 FIR="$BASE_PATH.fir"
 HOST_FIR="$BASE_PATH.host.fir"
@@ -183,38 +250,88 @@ KERNEL_LLVM_MLIR="$BASE_PATH.kernels.llvm.mlir"
 KERNEL_LL="$BASE_PATH.kernels.ll"
 PTX="$BASE_PATH.kernels.ptx"
 
-MAIN_OBJ="$BASE_PATH.main.o"
+MODGEN_OBJ="$OBJ_DIR/$BASE.modgen.o"
 
-EXE_PATH="$EXE"
+MAIN_OBJS=()
+for src in "${MAIN_SRCS[@]}"; do
+  stem="$(basename "$src")"
+  stem="${stem%.*}"
+  MAIN_OBJS+=("$OBJ_DIR/$stem.o")
+done
+
+EXTRA_OBJS=()
+for src in "${EXTRA_SRCS[@]}"; do
+  stem="$(basename "$src")"
+  stem="${stem%.*}"
+  EXTRA_OBJS+=("$OBJ_DIR/$stem.o")
+done
 
 log "kernel source: $KERNEL_SRC"
-log "main source:   $MAIN_SRC"
-log "output:        $EXE_PATH"
+log "main sources:  ${MAIN_SRCS[*]}"
+if [[ ${#EXTRA_SRCS[@]} -gt 0 ]]; then
+  log "extra sources: ${EXTRA_SRCS[*]}"
+fi
+log "output:        $EXE"
 log "workdir:       $WORKDIR"
+log "module dir:    $MOD_DIR"
 log "base:          $BASE"
 log "cuda sm:       sm_$SM"
 
-log "[1/10] Emit FIR"
-run "$FLANG" -fc1 -emit-fir "$KERNEL_SRC" -o "$FIR"
+# --------------------------------------------------------------------------- #
+# 1. Generate .mod files from the kernel source.
+#
+# This intentionally discards the object from ordinary compilation. The real
+# kernel object is produced by the FNACC FIR pipeline below. The .mod files are
+# needed so the main program can `use` modules defined by the kernel source.
+# --------------------------------------------------------------------------- #
 
-log "[2/10] Emit Triton + lower host to runtime calls"
+log "[1/11] Generate Fortran module files"
+run "$FLANG" \
+  -c "$KERNEL_SRC" \
+  "${INCLUDE_FLAGS[@]}" \
+  "${MODULE_FLAGS[@]}" \
+  "${FFLAGS[@]}" \
+  -o "$MODGEN_OBJ"
+
+# --------------------------------------------------------------------------- #
+# 2. Emit FIR for the FNACC kernel source.
+# --------------------------------------------------------------------------- #
+
+log "[2/11] Emit FIR for FNACC source"
+run "$FLANG" \
+  -fc1 \
+  -emit-fir \
+  "$KERNEL_SRC" \
+  -o "$FIR"
+
+# --------------------------------------------------------------------------- #
+# 3. FNACC pipeline: TTIR/JSON + host runtime lowering.
+# --------------------------------------------------------------------------- #
+
+log "[3/11] Run FNACC pipeline"
 run "$FIROPT" \
   "--fnacc-pipeline=ttir-output=$TTIR json-output=$JSON emit-fortran-aliases=true" \
   "$FIR" \
   -o "$HOST_FIR"
 
-test -s "$TTIR" || die "TTIR was not generated: $TTIR"
-test -s "$JSON" || die "JSON was not generated: $JSON"
-test -s "$HOST_FIR" || die "host FIR was not generated: $HOST_FIR"
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$TTIR" || die "TTIR was not generated: $TTIR"
+  test -s "$JSON" || die "JSON was not generated: $JSON"
+  test -s "$HOST_FIR" || die "host FIR was not generated: $HOST_FIR"
+fi
 
-log "[3/10] TTIR -> TTGIR"
+# --------------------------------------------------------------------------- #
+# 4-7. Triton -> PTX.
+# --------------------------------------------------------------------------- #
+
+log "[4/11] TTIR -> TTGIR"
 run "$TRITON_OPT" "$TTIR" \
   "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=1" \
   --canonicalize \
   --cse \
   -o "$TTGIR"
 
-log "[4/10] TTGIR -> LLVM MLIR"
+log "[5/11] TTGIR -> LLVM MLIR"
 run "$TRITON_OPT" "$TTGIR" \
   --tritongpu-coalesce \
   --triton-nvidia-gpu-plan-cta \
@@ -223,39 +340,74 @@ run "$TRITON_OPT" "$TTGIR" \
   --cse \
   -o "$KERNEL_LLVM_MLIR"
 
-log "[5/10] LLVM MLIR -> LLVM IR"
+log "[6/11] LLVM MLIR -> LLVM IR"
 run "$MLIR_TRANSLATE" \
   --mlir-to-llvmir \
   "$KERNEL_LLVM_MLIR" \
   -o "$KERNEL_LL"
 
-log "[6/10] LLVM IR -> PTX"
+log "[7/11] LLVM IR -> PTX"
 run "$LLC" \
   -march=nvptx64 \
   "-mcpu=sm_$SM" \
   "$KERNEL_LL" \
   -o "$PTX"
 
-test -s "$PTX" || die "PTX was not generated: $PTX"
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$PTX" || die "PTX was not generated: $PTX"
+fi
 
-log "[7/10] Compile transformed host FIR to LLVM IR"
+# --------------------------------------------------------------------------- #
+# 8-9. Host transformed FIR -> object.
+# --------------------------------------------------------------------------- #
+
+log "[8/11] Host FIR -> LLVM IR"
 run "$TCO" \
   "$HOST_FIR" \
   -o "$HOST_LL"
 
-log "[8/10] Compile host LLVM IR to object"
+log "[9/11] Host LLVM IR -> object"
 run "$CLANG" \
   -c "$HOST_LL" \
   -o "$HOST_OBJ"
 
-log "[9/10] Compile Fortran main"
-run "$FLANG" \
-  -c "$MAIN_SRC" \
-  -o "$MAIN_OBJ"
+# --------------------------------------------------------------------------- #
+# 10. Compile main/support sources.
+# --------------------------------------------------------------------------- #
 
-log "[10/10] Link executable"
+log "[10/11] Compile Fortran main/support sources"
+
+for i in "${!MAIN_SRCS[@]}"; do
+  src="${MAIN_SRCS[$i]}"
+  obj="${MAIN_OBJS[$i]}"
+  run "$FLANG" \
+    -c "$src" \
+    "${INCLUDE_FLAGS[@]}" \
+    "${MODULE_FLAGS[@]}" \
+    "${FFLAGS[@]}" \
+    -o "$obj"
+done
+
+for i in "${!EXTRA_SRCS[@]}"; do
+  src="${EXTRA_SRCS[$i]}"
+  obj="${EXTRA_OBJS[$i]}"
+  run "$FLANG" \
+    -c "$src" \
+    "${INCLUDE_FLAGS[@]}" \
+    "${MODULE_FLAGS[@]}" \
+    "${FFLAGS[@]}" \
+    -o "$obj"
+done
+
+# --------------------------------------------------------------------------- #
+# 11. Link.
+# --------------------------------------------------------------------------- #
+
+log "[11/11] Link executable"
+
 run "$FLANG" \
-  "$MAIN_OBJ" \
+  "${MAIN_OBJS[@]}" \
+  "${EXTRA_OBJS[@]}" \
   "$HOST_OBJ" \
   "-L$LLVM_BUILD/lib" \
   -lFortranFNACCRuntime \
@@ -264,28 +416,34 @@ run "$FLANG" \
   -lstdc++ \
   "-Wl,-rpath,$LLVM_BUILD/lib" \
   "-Wl,-rpath,$CUDA_LIB_DIR" \
-  -o "$EXE_PATH"
+  "${LDFLAGS[@]}" \
+  "${LIBS[@]}" \
+  -o "$EXE"
 
-RUNNER="$EXE_PATH.run"
+RUNNER="$EXE.run"
 
-cat > "$RUNNER" <<EOF
+if [[ "$DRY_RUN" != "1" ]]; then
+  EXE_ABS="$(abspath "$EXE")"
+  PTX_ABS="$(abspath "$PTX")"
+  JSON_ABS="$(abspath "$JSON")"
+
+  cat > "$RUNNER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-export FNACC_PTX="\${FNACC_PTX:-$PTX}"
-export FNACC_KERNELS_JSON="\${FNACC_KERNELS_JSON:-$JSON}"
+export FNACC_PTX="\${FNACC_PTX:-$PTX_ABS}"
+export FNACC_KERNELS_JSON="\${FNACC_KERNELS_JSON:-$JSON_ABS}"
 
-exec "$(realpath "$EXE_PATH")" "\$@"
+exec "$EXE_ABS" "\$@"
 EOF
 
-chmod +x "$RUNNER"
+  chmod +x "$RUNNER"
+fi
 
 log "done"
-log "executable: $EXE_PATH"
+log "executable: $EXE"
 log "runner:     $RUNNER"
 log "ptx:        $PTX"
 log "json:       $JSON"
+log "modules:    $MOD_DIR"
 
-if [[ "$KEEP" != "1" ]]; then
-  log "intermediate files kept in $WORKDIR"
-fi

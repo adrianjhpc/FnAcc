@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  fnacc-flang --kernel-src KERNEL.f90 --main-src MAIN.f90 -o EXE [options]
+
+Options:
+  --kernel-src FILE       Fortran source containing FNACC subroutine(s)
+  --main-src FILE         Fortran main program source
+  -o, --output EXE        Output executable name
+
+  --base NAME             Base name for intermediate files
+  --workdir DIR           Directory for intermediate files
+  --sm NUM                CUDA SM version, e.g. 80, 90
+  --keep                  Keep intermediate files
+  --verbose               Print commands before running them
+  -h, --help              Show this help
+
+Environment variables:
+  LLVM_BUILD              Path to llvm-project build directory
+  TRITON_OPT              Path to triton-opt
+  MLIR_TRANSLATE          Path to mlir-translate from Triton LLVM
+  LLC                     Path to llc from Triton LLVM
+  CUDA_LIB_DIR            Path to CUDA driver library directory
+
+Optional environment variables:
+  FNACC_SM                Default CUDA SM version, default 80
+  FNACC_WORKDIR           Default work directory, default current directory
+
+Example:
+  export LLVM_BUILD=/path/to/llvm-project/build
+  export TRITON_OPT=/path/to/triton/build/cmake.linux-x86_64-cpython-3.12/bin/triton-opt
+  export MLIR_TRANSLATE=/path/to/triton-llvm/build/bin/mlir-translate
+  export LLC=/path/to/triton-llvm/build/bin/llc
+  export CUDA_LIB_DIR=/usr/local/cuda/lib64
+
+  ./bin/fnacc-flang \
+    --kernel-src examples/vector-add/kernel.f90 \
+    --main-src examples/vector-add/main.f90 \
+    -o vector-add
+EOF
+}
+
+die() {
+  echo "fnacc-flang: error: $*" >&2
+  exit 1
+}
+
+log() {
+  echo "[fnacc-flang] $*" >&2
+}
+
+run() {
+  if [[ "${VERBOSE}" == "1" ]]; then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+  fi
+  "$@"
+}
+
+require_file() {
+  local path="$1"
+  [[ -f "$path" ]] || die "file not found: $path"
+}
+
+require_exe() {
+  local path="$1"
+  [[ -x "$path" ]] || die "executable not found or not executable: $path"
+}
+
+KERNEL_SRC=""
+MAIN_SRC=""
+EXE=""
+BASE=""
+WORKDIR="${FNACC_WORKDIR:-.}"
+SM="${FNACC_SM:-80}"
+KEEP=0
+VERBOSE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kernel-src)
+      [[ $# -ge 2 ]] || die "--kernel-src requires an argument"
+      KERNEL_SRC="$2"
+      shift 2
+      ;;
+    --main-src)
+      [[ $# -ge 2 ]] || die "--main-src requires an argument"
+      MAIN_SRC="$2"
+      shift 2
+      ;;
+    -o|--output)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      EXE="$2"
+      shift 2
+      ;;
+    --base)
+      [[ $# -ge 2 ]] || die "--base requires an argument"
+      BASE="$2"
+      shift 2
+      ;;
+    --workdir)
+      [[ $# -ge 2 ]] || die "--workdir requires an argument"
+      WORKDIR="$2"
+      shift 2
+      ;;
+    --sm)
+      [[ $# -ge 2 ]] || die "--sm requires an argument"
+      SM="$2"
+      shift 2
+      ;;
+    --keep)
+      KEEP=1
+      shift
+      ;;
+    --verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$KERNEL_SRC" ]] || die "missing --kernel-src"
+[[ -n "$MAIN_SRC" ]] || die "missing --main-src"
+[[ -n "$EXE" ]] || die "missing -o/--output"
+
+require_file "$KERNEL_SRC"
+require_file "$MAIN_SRC"
+
+LLVM_BUILD="${LLVM_BUILD:-}"
+[[ -n "$LLVM_BUILD" ]] || die "LLVM_BUILD is not set"
+
+FLANG="${FLANG:-$LLVM_BUILD/bin/flang-new}"
+FIROPT="${FIROPT:-$LLVM_BUILD/bin/fir-opt}"
+TCO="${TCO:-$LLVM_BUILD/bin/tco}"
+CLANG="${CLANG:-$LLVM_BUILD/bin/clang}"
+
+TRITON_OPT="${TRITON_OPT:-}"
+MLIR_TRANSLATE="${MLIR_TRANSLATE:-}"
+LLC="${LLC:-}"
+CUDA_LIB_DIR="${CUDA_LIB_DIR:-/usr/local/cuda/lib64}"
+
+[[ -n "$TRITON_OPT" ]] || die "TRITON_OPT is not set"
+[[ -n "$MLIR_TRANSLATE" ]] || die "MLIR_TRANSLATE is not set"
+[[ -n "$LLC" ]] || die "LLC is not set"
+
+require_exe "$FLANG"
+require_exe "$FIROPT"
+require_exe "$TCO"
+require_exe "$CLANG"
+require_exe "$TRITON_OPT"
+require_exe "$MLIR_TRANSLATE"
+require_exe "$LLC"
+
+mkdir -p "$WORKDIR"
+
+if [[ -z "$BASE" ]]; then
+  exe_base="$(basename "$EXE")"
+  BASE="$exe_base"
+fi
+
+BASE_PATH="$WORKDIR/$BASE"
+
+FIR="$BASE_PATH.fir"
+HOST_FIR="$BASE_PATH.host.fir"
+HOST_LL="$BASE_PATH.host.ll"
+HOST_OBJ="$BASE_PATH.host.o"
+
+TTIR="$BASE_PATH.kernels.ttir"
+JSON="$BASE_PATH.kernels.json"
+TTGIR="$BASE_PATH.kernels.ttgir.mlir"
+KERNEL_LLVM_MLIR="$BASE_PATH.kernels.llvm.mlir"
+KERNEL_LL="$BASE_PATH.kernels.ll"
+PTX="$BASE_PATH.kernels.ptx"
+
+MAIN_OBJ="$BASE_PATH.main.o"
+
+EXE_PATH="$EXE"
+
+log "kernel source: $KERNEL_SRC"
+log "main source:   $MAIN_SRC"
+log "output:        $EXE_PATH"
+log "workdir:       $WORKDIR"
+log "base:          $BASE"
+log "cuda sm:       sm_$SM"
+
+log "[1/10] Emit FIR"
+run "$FLANG" -fc1 -emit-fir "$KERNEL_SRC" -o "$FIR"
+
+log "[2/10] Emit Triton + lower host to runtime calls"
+run "$FIROPT" \
+  "--fnacc-pipeline=ttir-output=$TTIR json-output=$JSON emit-fortran-aliases=true" \
+  "$FIR" \
+  -o "$HOST_FIR"
+
+test -s "$TTIR" || die "TTIR was not generated: $TTIR"
+test -s "$JSON" || die "JSON was not generated: $JSON"
+test -s "$HOST_FIR" || die "host FIR was not generated: $HOST_FIR"
+
+log "[3/10] TTIR -> TTGIR"
+run "$TRITON_OPT" "$TTIR" \
+  "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=1" \
+  --canonicalize \
+  --cse \
+  -o "$TTGIR"
+
+log "[4/10] TTGIR -> LLVM MLIR"
+run "$TRITON_OPT" "$TTGIR" \
+  --tritongpu-coalesce \
+  --triton-nvidia-gpu-plan-cta \
+  --convert-triton-gpu-to-llvm \
+  --canonicalize \
+  --cse \
+  -o "$KERNEL_LLVM_MLIR"
+
+log "[5/10] LLVM MLIR -> LLVM IR"
+run "$MLIR_TRANSLATE" \
+  --mlir-to-llvmir \
+  "$KERNEL_LLVM_MLIR" \
+  -o "$KERNEL_LL"
+
+log "[6/10] LLVM IR -> PTX"
+run "$LLC" \
+  -march=nvptx64 \
+  "-mcpu=sm_$SM" \
+  "$KERNEL_LL" \
+  -o "$PTX"
+
+test -s "$PTX" || die "PTX was not generated: $PTX"
+
+log "[7/10] Compile transformed host FIR to LLVM IR"
+run "$TCO" \
+  "$HOST_FIR" \
+  -o "$HOST_LL"
+
+log "[8/10] Compile host LLVM IR to object"
+run "$CLANG" \
+  -c "$HOST_LL" \
+  -o "$HOST_OBJ"
+
+log "[9/10] Compile Fortran main"
+run "$FLANG" \
+  -c "$MAIN_SRC" \
+  -o "$MAIN_OBJ"
+
+log "[10/10] Link executable"
+run "$FLANG" \
+  "$MAIN_OBJ" \
+  "$HOST_OBJ" \
+  "-L$LLVM_BUILD/lib" \
+  -lFortranFNACCRuntime \
+  "-L$CUDA_LIB_DIR" \
+  -lcuda \
+  -lstdc++ \
+  "-Wl,-rpath,$LLVM_BUILD/lib" \
+  "-Wl,-rpath,$CUDA_LIB_DIR" \
+  -o "$EXE_PATH"
+
+RUNNER="$EXE_PATH.run"
+
+cat > "$RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export FNACC_PTX="\${FNACC_PTX:-$PTX}"
+export FNACC_KERNELS_JSON="\${FNACC_KERNELS_JSON:-$JSON}"
+
+exec "$(realpath "$EXE_PATH")" "\$@"
+EOF
+
+chmod +x "$RUNNER"
+
+log "done"
+log "executable: $EXE_PATH"
+log "runner:     $RUNNER"
+log "ptx:        $PTX"
+log "json:       $JSON"
+
+if [[ "$KEEP" != "1" ]]; then
+  log "intermediate files kept in $WORKDIR"
+fi

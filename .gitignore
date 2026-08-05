@@ -1,0 +1,16 @@
+build/
+CMakeUserPresets.json
+
+*.fir
+*.host.fir
+*.host.ll
+*.host.o
+*.kernels.ttir
+*.kernels.json
+*.kernels.ttgir.mlir
+*.kernels.llvm.mlir
+*.kernels.ll
+*.kernels.ptx
+*.main.o
+*.run
+

@@ -4,12 +4,8 @@ project(FNACCExamples LANGUAGES NONE)
 
 include(CTest)
 
-# -----------------------------------------------------------------------------#
-# User configuration
-# -----------------------------------------------------------------------------#
-
 set(LLVM_BUILD "" CACHE PATH
-  "Path to the llvm-project build directory containing flang-new, fir-opt, tco, clang")
+  "Path to llvm-project build directory containing flang-new, fir-opt, tco, clang")
 
 set(TRITON_OPT "" CACHE FILEPATH
   "Path to Triton triton-opt executable")
@@ -38,14 +34,10 @@ option(FNACC_ENABLE_TESTS
 option(FNACC_VERBOSE_WRAPPER
   "Pass --verbose to the fnacc-flang wrapper" OFF)
 
-# -----------------------------------------------------------------------------#
-# Validation helpers
-# -----------------------------------------------------------------------------#
-
 function(fnacc_require_path var description)
   if(NOT DEFINED ${var} OR "${${var}}" STREQUAL "")
     message(FATAL_ERROR
-      "${description} is required. Please configure with -D${var}=...")
+      "${description} is required. Configure with -D${var}=...")
   endif()
 endfunction()
 
@@ -104,14 +96,10 @@ message(STATUS "  CUDA_LIB_DIR:      ${CUDA_LIB_DIR}")
 message(STATUS "  FNACC_SM:          ${FNACC_SM}")
 message(STATUS "  wrapper:           ${FNACC_FLANG_WRAPPER}")
 
-# -----------------------------------------------------------------------------#
-# FNACC example helper
-# -----------------------------------------------------------------------------#
-
 function(add_fnacc_example name)
   set(options)
   set(one_value_args DIRECTORY)
-  set(multi_value_args)
+  set(multi_value_args MAIN_SRCS EXTRA_SRCS)
   cmake_parse_arguments(ARG
     "${options}"
     "${one_value_args}"
@@ -124,10 +112,27 @@ function(add_fnacc_example name)
 
   set(example_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/${ARG_DIRECTORY}")
   set(kernel_src "${example_src_dir}/kernel.f90")
-  set(main_src "${example_src_dir}/main.f90")
 
   fnacc_require_file("${kernel_src}" "Kernel source for ${name}")
-  fnacc_require_file("${main_src}" "Main source for ${name}")
+
+  if(ARG_MAIN_SRCS)
+    set(main_srcs)
+    foreach(src ${ARG_MAIN_SRCS})
+      list(APPEND main_srcs "${example_src_dir}/${src}")
+    endforeach()
+  else()
+    set(main_srcs "${example_src_dir}/main.f90")
+  endif()
+
+  foreach(src ${main_srcs})
+    fnacc_require_file("${src}" "Main source for ${name}")
+  endforeach()
+
+  set(extra_srcs)
+  foreach(src ${ARG_EXTRA_SRCS})
+    list(APPEND extra_srcs "${example_src_dir}/${src}")
+    fnacc_require_file("${example_src_dir}/${src}" "Extra source for ${name}")
+  endforeach()
 
   set(example_build_dir "${CMAKE_CURRENT_BINARY_DIR}/examples/${name}")
   set(example_exe "${example_build_dir}/${name}")
@@ -136,39 +141,36 @@ function(add_fnacc_example name)
   set(base "${name}")
   set(base_path "${example_build_dir}/${base}")
 
-  set(fir_file "${base_path}.fir")
-  set(host_fir_file "${base_path}.host.fir")
-  set(host_ll_file "${base_path}.host.ll")
-  set(host_obj_file "${base_path}.host.o")
-  set(ttir_file "${base_path}.kernels.ttir")
-  set(json_file "${base_path}.kernels.json")
-  set(ttgir_file "${base_path}.kernels.ttgir.mlir")
-  set(kernel_llvm_mlir_file "${base_path}.kernels.llvm.mlir")
-  set(kernel_ll_file "${base_path}.kernels.ll")
-  set(ptx_file "${base_path}.kernels.ptx")
-  set(main_obj_file "${base_path}.main.o")
-
   set(wrapper_args)
   if(FNACC_VERBOSE_WRAPPER)
     list(APPEND wrapper_args --verbose)
   endif()
+
+  set(main_args)
+  foreach(src ${main_srcs})
+    list(APPEND main_args --main-src "${src}")
+  endforeach()
+
+  set(extra_args)
+  foreach(src ${extra_srcs})
+    list(APPEND extra_args --extra-src "${src}")
+  endforeach()
 
   add_custom_command(
     OUTPUT
       "${example_exe}"
       "${example_runner}"
     BYPRODUCTS
-      "${fir_file}"
-      "${host_fir_file}"
-      "${host_ll_file}"
-      "${host_obj_file}"
-      "${ttir_file}"
-      "${json_file}"
-      "${ttgir_file}"
-      "${kernel_llvm_mlir_file}"
-      "${kernel_ll_file}"
-      "${ptx_file}"
-      "${main_obj_file}"
+      "${base_path}.fir"
+      "${base_path}.host.fir"
+      "${base_path}.host.ll"
+      "${base_path}.host.o"
+      "${base_path}.kernels.ttir"
+      "${base_path}.kernels.json"
+      "${base_path}.kernels.ttgir.mlir"
+      "${base_path}.kernels.llvm.mlir"
+      "${base_path}.kernels.ll"
+      "${base_path}.kernels.ptx"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${example_build_dir}"
     COMMAND "${CMAKE_COMMAND}" -E env
       "LLVM_BUILD=${LLVM_BUILD}"
@@ -179,7 +181,8 @@ function(add_fnacc_example name)
       "FNACC_SM=${FNACC_SM}"
       "${FNACC_FLANG_WRAPPER}"
         --kernel-src "${kernel_src}"
-        --main-src "${main_src}"
+        ${main_args}
+        ${extra_args}
         --workdir "${example_build_dir}"
         --base "${base}"
         -o "${example_exe}"
@@ -187,13 +190,13 @@ function(add_fnacc_example name)
     DEPENDS
       "${FNACC_FLANG_WRAPPER}"
       "${kernel_src}"
-      "${main_src}"
+      ${main_srcs}
+      ${extra_srcs}
     COMMENT "Building FNACC example ${name}"
     VERBATIM
   )
 
   add_custom_target("${name}" DEPENDS "${example_exe}" "${example_runner}")
-
   set_property(TARGET "${name}" PROPERTY FOLDER "FNACC Examples")
 
   if(FNACC_ENABLE_TESTS AND BUILD_TESTING)
@@ -206,7 +209,7 @@ function(add_fnacc_example name)
       LABELS "FNACC"
       WORKING_DIRECTORY "${example_build_dir}"
       ENVIRONMENT
-        "FNACC_PTX=${ptx_file};FNACC_KERNELS_JSON=${json_file}"
+        "FNACC_PTX=${base_path}.kernels.ptx;FNACC_KERNELS_JSON=${base_path}.kernels.json"
     )
   endif()
 
@@ -215,10 +218,6 @@ function(add_fnacc_example name)
     "${name}"
     PARENT_SCOPE)
 endfunction()
-
-# -----------------------------------------------------------------------------#
-# Examples
-# -----------------------------------------------------------------------------#
 
 set(FNACC_EXAMPLE_TARGETS)
 
@@ -234,6 +233,9 @@ add_fnacc_example(axpby
 add_fnacc_example(matrix-add-2d
   DIRECTORY examples/matrix-add-2d)
 
+add_fnacc_example(module-vector-add
+  DIRECTORY examples/module-vector-add)
+
 if(FNACC_BUILD_EXAMPLES_BY_DEFAULT)
   add_custom_target(fnacc-examples ALL
     DEPENDS ${FNACC_EXAMPLE_TARGETS})
@@ -241,10 +243,6 @@ else()
   add_custom_target(fnacc-examples
     DEPENDS ${FNACC_EXAMPLE_TARGETS})
 endif()
-
-# -----------------------------------------------------------------------------#
-# Convenience information target
-# -----------------------------------------------------------------------------#
 
 add_custom_target(fnacc-print-config
   COMMAND "${CMAKE_COMMAND}" -E echo "LLVM_BUILD=${LLVM_BUILD}"

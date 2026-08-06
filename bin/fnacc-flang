@@ -79,6 +79,58 @@ abspath() {
   python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
+generate_embedded_c() {
+  local ptx_file="$1"
+  local json_file="$2"
+  local out_c="$3"
+
+  python3 - "$ptx_file" "$json_file" "$out_c" <<'PY'
+import sys
+from pathlib import Path
+
+ptx_path = Path(sys.argv[1])
+json_path = Path(sys.argv[2])
+out_path = Path(sys.argv[3])
+
+ptx = ptx_path.read_bytes()
+json = json_path.read_bytes()
+
+def emit_array(name, data):
+    lines = []
+    lines.append(f"static const unsigned char {name}[] = {{")
+    for i in range(0, len(data), 12):
+        chunk = data[i:i + 12]
+        line = "  " + ", ".join(f"0x{b:02x}" for b in chunk) + ","
+        lines.append(line)
+    lines.append("};")
+    return "\n".join(lines)
+
+content = f"""\
+#include <stddef.h>
+
+extern void __fnacc_register_embedded_kernels(
+    const char *ptxData, size_t ptxSize,
+    const char *jsonData, size_t jsonSize);
+
+{emit_array("__fnacc_embedded_ptx", ptx)}
+
+{emit_array("__fnacc_embedded_json", json)}
+
+__attribute__((constructor))
+static void __fnacc_register_embedded_payload(void) {{
+  __fnacc_register_embedded_kernels(
+      (const char *)__fnacc_embedded_ptx,
+      sizeof(__fnacc_embedded_ptx),
+      (const char *)__fnacc_embedded_json,
+      sizeof(__fnacc_embedded_json));
+}}
+"""
+
+out_path.write_text(content)
+PY
+}
+
+
 KERNEL_SRC=""
 MAIN_SRCS=()
 EXTRA_SRCS=()
@@ -250,6 +302,9 @@ KERNEL_LLVM_MLIR="$BASE_PATH.kernels.llvm.mlir"
 KERNEL_LL="$BASE_PATH.kernels.ll"
 PTX="$BASE_PATH.kernels.ptx"
 
+EMBED_C="$BASE_PATH.embedded.c"
+EMBED_OBJ="$BASE_PATH.embedded.o"
+
 MODGEN_OBJ="$OBJ_DIR/$BASE.modgen.o"
 
 MAIN_OBJS=()
@@ -285,19 +340,19 @@ log "cuda sm:       sm_$SM"
 # needed so the main program can `use` modules defined by the kernel source.
 # --------------------------------------------------------------------------- #
 
-log "[1/11] Generate Fortran module files"
+log "[1/12] Generate Fortran module files"
 run "$FLANG" \
-  -c "$KERNEL_SRC" \
+  -fsyntax-only "$KERNEL_SRC" \
   "${INCLUDE_FLAGS[@]}" \
   "${MODULE_FLAGS[@]}" \
-  "${FFLAGS[@]}" \
-  -o "$MODGEN_OBJ"
+  "${FFLAGS[@]}"
+
 
 # --------------------------------------------------------------------------- #
 # 2. Emit FIR for the FNACC kernel source.
 # --------------------------------------------------------------------------- #
 
-log "[2/11] Emit FIR for FNACC source"
+log "[2/12] Emit FIR for FNACC source"
 run "$FLANG" \
   -fc1 \
   -emit-fir \
@@ -308,7 +363,7 @@ run "$FLANG" \
 # 3. FNACC pipeline: TTIR/JSON + host runtime lowering.
 # --------------------------------------------------------------------------- #
 
-log "[3/11] Run FNACC pipeline"
+log "[3/12] Run FNACC pipeline"
 run "$FIROPT" \
   "--fnacc-pipeline=ttir-output=$TTIR json-output=$JSON emit-fortran-aliases=true" \
   "$FIR" \
@@ -321,17 +376,17 @@ if [[ "$DRY_RUN" != "1" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 4-7. Triton -> PTX.
+# 4-8. Triton -> PTX.
 # --------------------------------------------------------------------------- #
 
-log "[4/11] TTIR -> TTGIR"
+log "[4/12] TTIR -> TTGIR"
 run "$TRITON_OPT" "$TTIR" \
   "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=1" \
   --canonicalize \
   --cse \
   -o "$TTGIR"
 
-log "[5/11] TTGIR -> LLVM MLIR"
+log "[5/12] TTGIR -> LLVM MLIR"
 run "$TRITON_OPT" "$TTGIR" \
   --tritongpu-coalesce \
   --triton-nvidia-gpu-plan-cta \
@@ -340,13 +395,13 @@ run "$TRITON_OPT" "$TTGIR" \
   --cse \
   -o "$KERNEL_LLVM_MLIR"
 
-log "[6/11] LLVM MLIR -> LLVM IR"
+log "[6/12] LLVM MLIR -> LLVM IR"
 run "$MLIR_TRANSLATE" \
   --mlir-to-llvmir \
   "$KERNEL_LLVM_MLIR" \
   -o "$KERNEL_LL"
 
-log "[7/11] LLVM IR -> PTX"
+log "[7/12] LLVM IR -> PTX"
 run "$LLC" \
   -march=nvptx64 \
   "-mcpu=sm_$SM" \
@@ -357,25 +412,33 @@ if [[ "$DRY_RUN" != "1" ]]; then
   test -s "$PTX" || die "PTX was not generated: $PTX"
 fi
 
+log "[8/12] Embed PTX and JSON into object"
+generate_embedded_c "$PTX" "$JSON" "$EMBED_C"
+
+run "$CLANG" \
+  -c "$EMBED_C" \
+  -o "$EMBED_OBJ"
+
+
 # --------------------------------------------------------------------------- #
-# 8-9. Host transformed FIR -> object.
+# 9-10. Host transformed FIR -> object.
 # --------------------------------------------------------------------------- #
 
-log "[8/11] Host FIR -> LLVM IR"
+log "[9/12] Host FIR -> LLVM IR"
 run "$TCO" \
   "$HOST_FIR" \
   -o "$HOST_LL"
 
-log "[9/11] Host LLVM IR -> object"
+log "[10/12] Host LLVM IR -> object"
 run "$CLANG" \
   -c "$HOST_LL" \
   -o "$HOST_OBJ"
 
 # --------------------------------------------------------------------------- #
-# 10. Compile main/support sources.
+# 11. Compile main/support sources.
 # --------------------------------------------------------------------------- #
 
-log "[10/11] Compile Fortran main/support sources"
+log "[11/12] Compile Fortran main/support sources"
 
 for i in "${!MAIN_SRCS[@]}"; do
   src="${MAIN_SRCS[$i]}"
@@ -400,15 +463,16 @@ for i in "${!EXTRA_SRCS[@]}"; do
 done
 
 # --------------------------------------------------------------------------- #
-# 11. Link.
+# 12. Link.
 # --------------------------------------------------------------------------- #
 
-log "[11/11] Link executable"
+log "[12/12] Link executable"
 
 run "$FLANG" \
   "${MAIN_OBJS[@]}" \
   "${EXTRA_OBJS[@]}" \
   "$HOST_OBJ" \
+  "$EMBED_OBJ" \
   "-L$LLVM_BUILD/lib" \
   -lFortranFNACCRuntime \
   "-L$CUDA_LIB_DIR" \

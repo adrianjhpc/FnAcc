@@ -54,11 +54,23 @@ function(fnacc_require_executable path description)
       "${description} does not exist: ${path}")
   endif()
 
-  if(NOT IS_EXECUTABLE "${path}")
+  if(IS_DIRECTORY "${path}")
     message(FATAL_ERROR
-      "${description} is not executable: ${path}")
+      "${description} is a directory, expected executable file: ${path}")
+  endif()
+
+  execute_process(
+    COMMAND test -x "${path}"
+    RESULT_VARIABLE is_executable_result
+  )
+
+  if(NOT is_executable_result EQUAL 0)
+    message(FATAL_ERROR
+      "${description} is not executable: ${path}\n"
+      "Try: chmod +x ${path}")
   endif()
 endfunction()
+
 
 fnacc_require_path(LLVM_BUILD "LLVM build directory")
 fnacc_require_path(TRITON_OPT "Triton triton-opt")
@@ -235,6 +247,13 @@ add_fnacc_example(matrix-add-2d
 
 add_fnacc_example(module-vector-add
   DIRECTORY examples/module-vector-add)
+
+add_fnacc_example(assumed-shape-matrix-add-2d
+  DIRECTORY examples/assumed-shape-matrix-add-2d)
+
+add_fnacc_example(update-before-launch
+  DIRECTORY examples/update-before-launch)
+
 
 if(FNACC_BUILD_EXAMPLES_BY_DEFAULT)
   add_custom_target(fnacc-examples ALL

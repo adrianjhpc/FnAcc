@@ -42,6 +42,15 @@ set(NVFORTRAN "" CACHE FILEPATH
 set(NVCC "" CACHE FILEPATH
   "Path to nvcc for CUDA baselines")
 
+set(FNACC_NUM_WARPS "1" CACHE STRING
+  "Number of Triton warps for FNACC-generated kernels")
+
+set(FNACC_THREADS_PER_WARP "32" CACHE STRING
+  "Triton/CUDA threads per warp")
+
+set(FNACC_NUM_STAGES "3" CACHE STRING
+  "Triton pipeline stages")
+
 # -----------------------------------------------------------------------------
 # Tool discovery
 # -----------------------------------------------------------------------------
@@ -92,6 +101,9 @@ function(add_fnacc_benchmark name kernel main)
       "LLC=${LLC}"
       "CUDA_LIB_DIR=${CUDA_LIB_DIR}"
       "FNACC_SM=${FNACC_SM}"
+      "FNACC_NUM_WARPS=${FNACC_NUM_WARPS}"
+      "FNACC_THREADS_PER_WARP=${FNACC_THREADS_PER_WARP}"
+      "FNACC_NUM_STAGES=${FNACC_NUM_STAGES}"
       "${FNACC_WRAPPER}"
         --kernel-src "${CMAKE_CURRENT_LIST_DIR}/fnacc/${kernel}"
         --main-src "${CMAKE_CURRENT_LIST_DIR}/fnacc/${main}"

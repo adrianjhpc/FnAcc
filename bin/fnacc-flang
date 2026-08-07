@@ -34,7 +34,8 @@ Environment:
   CUDA_LIB_DIR             CUDA library directory, default /usr/local/cuda/lib64
 
 Optional environment:
-  FNGPU_SM / FNACC_SM      default CUDA SM, default 80
+  FNACC_NUM_WARPS          number of warps to use, defaults to 1.
+  FNACC_SM                 default CUDA SM, default 80
   FNACC_WORKDIR            default work directory, default current directory
   FLANG                    override flang-new
   FIROPT                   override fir-opt
@@ -137,7 +138,10 @@ EXTRA_SRCS=()
 EXE=""
 BASE=""
 WORKDIR="${FNACC_WORKDIR:-.}"
-SM="${FNACC_SM:-${FNGPU_SM:-80}}"
+SM="${FNACC_SM:-80}"
+NUM_WARPS="${FNACC_NUM_WARPS:-1}"
+THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-32}"
+NUM_STAGES="${FNACC_NUM_STAGES:-3}"
 KEEP=0
 VERBOSE=0
 DRY_RUN=0
@@ -240,6 +244,30 @@ require_file "$KERNEL_SRC"
 for src in "${MAIN_SRCS[@]}"; do require_file "$src"; done
 for src in "${EXTRA_SRCS[@]}"; do require_file "$src"; done
 
+SM="${SM#sm_}"
+SM="${SM#cc}"
+
+if ! [[ "$SM" =~ ^[0-9]+$ ]]; then
+  die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, or cc80"
+fi
+
+if ! [[ "$NUM_WARPS" =~ ^[0-9]+$ ]]; then
+  die "invalid FNACC_NUM_WARPS value '$NUM_WARPS'; expected integer"
+fi
+
+if ! [[ "$THREADS_PER_WARP" =~ ^[0-9]+$ ]]; then
+  die "invalid FNACC_THREADS_PER_WARP value '$THREADS_PER_WARP'; expected integer"
+fi
+
+if ! [[ "$NUM_STAGES" =~ ^[0-9]+$ ]]; then
+  die "invalid FNACC_NUM_STAGES value '$NUM_STAGES'; expected integer"
+fi
+
+log "cuda sm:       sm_$SM"
+log "triton warps:  $NUM_WARPS"
+log "threads/warp:  $THREADS_PER_WARP"
+log "triton stages: $NUM_STAGES"
+
 LLVM_BUILD="${LLVM_BUILD:-}"
 [[ -n "$LLVM_BUILD" ]] || die "LLVM_BUILD is not set"
 
@@ -325,6 +353,72 @@ for src in "${EXTRA_SRCS[@]}"; do
   EXTRA_OBJS+=("$OBJ_DIR/$stem.o")
 done
 
+validate_no_triton_gpu_ops() {
+  local file="$1"
+
+  local ttg_left
+  local tt_left
+
+  ttg_left="$(mktemp)"
+  tt_left="$(mktemp)"
+
+  # Match actual TritonGPU operations, not module attributes.
+  #
+  # Catches:
+  #   %12 = ttg.warp_id ...
+  #   ttg.some_op ...
+  #   %0 = "ttg.some_op"(...)
+  #   "ttg.some_op"(...)
+  #
+  # Does not catch:
+  #   module attributes {"ttg.num-warps" = ...}
+  #   ttg.target = "cuda:80" inside an attribute dictionary
+  grep -nE '^[[:space:]]*((%[A-Za-z0-9_.$#-]+[[:space:]]*=[[:space:]]*)?)("?ttg\.)' \
+    "$file" > "$ttg_left" || true
+
+  if [[ -s "$ttg_left" ]]; then
+    echo "fnacc-flang: error: residual TritonGPU dialect ops remain after LLVM lowering:" >&2
+    head -20 "$ttg_left" >&2
+    echo >&2
+    echo "This usually means the Triton pass pipeline did not fully lower TTGIR." >&2
+    echo "If using multi-warp lowering, try FNACC_NUM_WARPS=1 or set FNACC_TTGIR_TO_LLVM_PASSES." >&2
+    rm -f "$ttg_left" "$tt_left"
+    exit 1
+  fi
+
+  # Match actual Triton operations, not attributes.
+  #
+  # Catches:
+  #   %0 = tt.load ...
+  #   tt.store ...
+  #   %0 = "tt.load"(...)
+  #
+  # Avoids matching words containing "tt." elsewhere.
+  grep -nE '^[[:space:]]*((%[A-Za-z0-9_.$#-]+[[:space:]]*=[[:space:]]*)?)("?tt\.)' \
+    "$file" > "$tt_left" || true
+
+  if [[ -s "$tt_left" ]]; then
+    echo "fnacc-flang: error: residual Triton dialect ops remain after LLVM lowering:" >&2
+    head -20 "$tt_left" >&2
+    rm -f "$ttg_left" "$tt_left"
+    exit 1
+  fi
+
+  rm -f "$ttg_left" "$tt_left"
+}
+
+
+split_pass_pipeline() {
+  local text="$1"
+  python3 - "$text" <<'PY'
+import shlex
+import sys
+
+for item in shlex.split(sys.argv[1]):
+    print(item)
+PY
+}
+
 log "kernel source: $KERNEL_SRC"
 log "main sources:  ${MAIN_SRCS[*]}"
 if [[ ${#EXTRA_SRCS[@]} -gt 0 ]]; then
@@ -369,7 +463,7 @@ run "$FLANG" \
 
 log "[3/12] Run FNACC pipeline"
 run "$FIROPT" \
-  "--fnacc-pipeline=ttir-output=$TTIR json-output=$JSON emit-fortran-aliases=true" \
+  "--fnacc-pipeline=ttir-output=$TTIR json-output=$JSON emit-fortran-aliases=true num-warps=$NUM_WARPS threads-per-warp=$THREADS_PER_WARP num-stages=$NUM_STAGES" \
   "$FIR" \
   -o "$HOST_FIR"
 
@@ -385,19 +479,33 @@ fi
 
 log "[4/12] TTIR -> TTGIR"
 run "$TRITON_OPT" "$TTIR" \
-  "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=1" \
+  "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$NUM_WARPS" \
   --canonicalize \
   --cse \
   -o "$TTGIR"
 
 log "[5/12] TTGIR -> LLVM MLIR"
-run "$TRITON_OPT" "$TTGIR" \
-  --tritongpu-coalesce \
-  --triton-nvidia-gpu-plan-cta \
-  --convert-triton-gpu-to-llvm \
-  --canonicalize \
-  --cse \
-  -o "$KERNEL_LLVM_MLIR"
+
+if [[ -n "${FNACC_TTGIR_TO_LLVM_PASSES:-}" ]]; then
+  mapfile -t TTGIR_TO_LLVM_PASSES < <(split_pass_pipeline "$FNACC_TTGIR_TO_LLVM_PASSES")
+
+  run "$TRITON_OPT" "$TTGIR" \
+    "${TTGIR_TO_LLVM_PASSES[@]}" \
+    -o "$KERNEL_LLVM_MLIR"
+else
+  run "$TRITON_OPT" "$TTGIR" \
+    --tritongpu-coalesce \
+    --tritongpu-remove-layout-conversions \
+    --tritongpu-optimize-thread-locality \
+    --triton-nvidia-gpu-plan-cta \
+    --tritongpu-allocate-warp-groups \
+    --convert-triton-gpu-to-llvm \
+    --canonicalize \
+    --cse \
+    -o "$KERNEL_LLVM_MLIR"
+fi
+
+validate_no_triton_gpu_ops "$KERNEL_LLVM_MLIR"
 
 log "[6/12] LLVM MLIR -> LLVM IR"
 run "$MLIR_TRANSLATE" \

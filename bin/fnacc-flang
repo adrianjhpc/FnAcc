@@ -275,6 +275,10 @@ BASE_PATH="$WORKDIR/$BASE"
 MOD_DIR="$WORKDIR/mod"
 OBJ_DIR="$WORKDIR/obj"
 
+# Fortran .mod files are compiler-specific. Always clean the wrapper's private
+# module/object directories to avoid accidentally consuming a stale module file
+# produced by gfortran, nvfortran, or another Flang build.
+rm -rf "$MOD_DIR" "$OBJ_DIR"
 mkdir -p "$MOD_DIR" "$OBJ_DIR"
 
 # Always include our generated module directory.
@@ -438,11 +442,16 @@ run "$CLANG" \
 # 11. Compile main/support sources.
 # --------------------------------------------------------------------------- #
 
-log "[11/12] Compile Fortran main/support sources"
+log "[11/12] Compile Fortran support/main sources"
 
-for i in "${!MAIN_SRCS[@]}"; do
-  src="${MAIN_SRCS[$i]}"
-  obj="${MAIN_OBJS[$i]}"
+# Compile support sources first. These may define modules used by the main
+# program, e.g. benchmarks/common/bench_utils.f90 provides bench_utils.mod.
+#
+# If support sources depend on each other, pass them in dependency order via
+# repeated --extra-src arguments.
+for i in "${!EXTRA_SRCS[@]}"; do
+  src="${EXTRA_SRCS[$i]}"
+  obj="${EXTRA_OBJS[$i]}"
   run "$FLANG" \
     -c "$src" \
     "${INCLUDE_FLAGS[@]}" \
@@ -451,9 +460,10 @@ for i in "${!MAIN_SRCS[@]}"; do
     -o "$obj"
 done
 
-for i in "${!EXTRA_SRCS[@]}"; do
-  src="${EXTRA_SRCS[$i]}"
-  obj="${EXTRA_OBJS[$i]}"
+# Compile main sources after support modules have been generated.
+for i in "${!MAIN_SRCS[@]}"; do
+  src="${MAIN_SRCS[$i]}"
+  obj="${MAIN_OBJS[$i]}"
   run "$FLANG" \
     -c "$src" \
     "${INCLUDE_FLAGS[@]}" \

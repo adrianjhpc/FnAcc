@@ -1,6 +1,7 @@
 build/
 CMakeUserPresets.json
 
+*.csv
 *.fir
 *.host.fir
 *.host.ll

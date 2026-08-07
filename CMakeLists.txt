@@ -273,3 +273,4 @@ add_custom_target(fnacc-print-config
   COMMAND "${CMAKE_COMMAND}" -E echo "FNACC_FLANG_WRAPPER=${FNACC_FLANG_WRAPPER}"
 )
 
+add_subdirectory(benchmarks)

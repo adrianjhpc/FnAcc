@@ -1,0 +1,63 @@
+program saxpy_fnacc
+  use bench_utils
+  use fnacc_saxpy_kernel
+  implicit none
+
+  integer(8) :: n
+  integer :: reps
+  real, allocatable :: x(:), y(:), y0(:)
+  real :: alpha
+  real :: expected
+  integer(8) :: i
+  integer :: r, errors
+  real(8) :: t0, t1, elapsed
+  real(8) :: bytes_per_rep
+
+  call parse_i64_arg(1, 1048576_8, n)
+  call parse_i32_arg(2, 100, reps)
+
+  alpha = 3.0
+
+  allocate(x(n), y(n), y0(n))
+
+  do i = 1, n
+    x(i) = real(i)
+    y(i) = 10.0 + real(i)
+    y0(i) = y(i)
+  end do
+
+  call saxpy_prepare(x, y)
+
+  call saxpy_compute(alpha, x, y)
+  call saxpy_fetch(y)
+
+  do i = 1, n
+    y(i) = y0(i)
+  end do
+  call saxpy_prepare(x, y)
+
+  t0 = wall_time()
+  do r = 1, reps
+    call saxpy_compute(alpha, x, y)
+  end do
+  t1 = wall_time()
+
+  call saxpy_fetch(y)
+
+  errors = 0
+  do i = 1, n
+    expected = y0(i)
+    do r = 1, reps
+      expected = alpha * x(i) + expected
+    end do
+    if (.not. almost_equal_f32(y(i), expected)) errors = errors + 1
+  end do
+
+  call saxpy_release(x, y)
+
+  elapsed = t1 - t0
+  bytes_per_rep = 3.0d0 * real(n, 8) * 4.0d0
+
+  call print_result("fnacc_saxpy", n, 1_8, reps, elapsed, bytes_per_rep, errors)
+end program
+

@@ -426,6 +426,67 @@ validate_no_unrealized_casts() {
   rm -f "$left"
 }
 
+lower_residual_ttg_warp_id() {
+  local file="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  python3 - "$file" "$tmp" <<'PY'
+import re
+import sys
+
+inp = sys.argv[1]
+out = sys.argv[2]
+
+# Matches lines such as:
+#
+#   %67 = ttg.warp_id {omitUniformHint}
+#   %67 = ttg.warp_id
+#   %67 = ttg.warp_id {omitUniformHint} : i32
+#
+# after TritonGPU-to-LLVM lowering has otherwise completed.
+pat = re.compile(
+    r'^(\s*)(%[A-Za-z0-9_.$#-]+)\s*=\s*ttg\.warp_id'
+    r'(?:\s*\{[^}]*\})?'
+    r'(?:\s*:\s*i32)?\s*$'
+)
+
+changed = 0
+
+with open(inp, "r", encoding="utf-8") as f, open(out, "w", encoding="utf-8") as g:
+    for line in f:
+        text = line.rstrip("\n")
+        m = pat.match(text)
+        if not m:
+            g.write(line)
+            continue
+
+        indent, name = m.groups()
+
+        # NVPTX special register %warpid.
+        #
+        # This is deliberately done after TritonGPU-to-LLVM conversion, where
+        # the result is an ordinary i32 value used by already-lowered LLVM/NVVM
+        # code. It avoids depending on Triton's internal ttg.warp_id lowering,
+        # which varies between Triton versions.
+        g.write(
+            f'{indent}{name} = llvm.inline_asm has_side_effects '
+            f'asm_dialect = att "mov.u32 $0, %warpid;", "=r" '
+            f': () -> i32\n'
+        )
+        changed += 1
+
+if changed:
+    print(
+        f"fnacc-flang: lowered {changed} residual ttg.warp_id op(s) "
+        f"using NVPTX inline asm",
+        file=sys.stderr,
+    )
+PY
+
+  mv "$tmp" "$file"
+}
+
 split_pass_pipeline() {
   local text="$1"
   python3 - "$text" <<'PY'
@@ -436,6 +497,39 @@ for item in shlex.split(sys.argv[1]):
     print(item)
 PY
 }
+
+read_effective_num_warps_from_json() {
+  local json_file="$1"
+  local fallback="$2"
+
+  python3 - "$json_file" "$fallback" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+fallback = int(sys.argv[2])
+
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+kernels = data.get("kernels", [])
+if not kernels:
+    print(fallback)
+    raise SystemExit(0)
+
+warps = []
+for k in kernels:
+    try:
+        warps.append(int(k.get("num_warps", fallback)))
+    except Exception:
+        warps.append(fallback)
+
+# Current FNACC TTIR uses one module-wide warp count. If future kernels differ,
+# using max is conservative for the external triton-opt invocation.
+print(max(warps) if warps else fallback)
+PY
+}
+
 
 log "kernel source: $KERNEL_SRC"
 log "main sources:  ${MAIN_SRCS[*]}"
@@ -491,13 +585,21 @@ if [[ "$DRY_RUN" != "1" ]]; then
   test -s "$HOST_FIR" || die "host FIR was not generated: $HOST_FIR"
 fi
 
+EFFECTIVE_NUM_WARPS="$NUM_WARPS"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  EFFECTIVE_NUM_WARPS="$(read_effective_num_warps_from_json "$JSON" "$NUM_WARPS")"
+fi
+
+log "effective warps: $EFFECTIVE_NUM_WARPS"
+
 # --------------------------------------------------------------------------- #
 # 4-8. Triton -> PTX.
 # --------------------------------------------------------------------------- #
 
 log "[4/12] TTIR -> TTGIR"
 run "$TRITON_OPT" "$TTIR" \
-  "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$NUM_WARPS" \
+  "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$EFFECTIVE_NUM_WARPS" \
   --canonicalize \
   --cse \
   -o "$TTGIR"
@@ -518,9 +620,11 @@ else
     --triton-nvidia-gpu-plan-cta \
     --tritongpu-allocate-warp-groups \
     --allocate-shared-memory-nv \
+    --convert-scf-to-cf \
+    --canonicalize \
+    --cse \
     --convert-triton-gpu-to-llvm \
     --convert-index-to-llvm \
-    --convert-scf-to-cf \
     --convert-arith-to-llvm \
     --convert-cf-to-llvm \
     --reconcile-unrealized-casts \
@@ -529,9 +633,9 @@ else
     -o "$KERNEL_LLVM_MLIR"
 fi
 
+lower_residual_ttg_warp_id "$KERNEL_LLVM_MLIR"
 validate_no_triton_gpu_ops "$KERNEL_LLVM_MLIR"
-validate_no_triton_gpu_ops "$KERNEL_LLVM_MLIR"
-validate_no_unrealized_casts "$KERNEL_LLVM_MLIR"i
+validate_no_unrealized_casts "$KERNEL_LLVM_MLIR"
 
 log "[6/12] LLVM MLIR -> LLVM IR"
 run "$MLIR_TRANSLATE" \

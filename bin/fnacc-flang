@@ -407,6 +407,24 @@ validate_no_triton_gpu_ops() {
   rm -f "$ttg_left" "$tt_left"
 }
 
+validate_no_unrealized_casts() {
+  local file="$1"
+  local left
+
+  left="$(mktemp)"
+
+  grep -nE 'builtin\.unrealized_conversion_cast|"builtin\.unrealized_conversion_cast"' \
+    "$file" > "$left" || true
+
+  if [[ -s "$left" ]]; then
+    echo "fnacc-flang: error: unrealized conversion casts remain before LLVM translation:" >&2
+    head -20 "$left" >&2
+    rm -f "$left"
+    exit 1
+  fi
+
+  rm -f "$left"
+}
 
 split_pass_pipeline() {
   local text="$1"
@@ -499,13 +517,21 @@ else
     --tritongpu-optimize-thread-locality \
     --triton-nvidia-gpu-plan-cta \
     --tritongpu-allocate-warp-groups \
+    --allocate-shared-memory-nv \
     --convert-triton-gpu-to-llvm \
+    --convert-index-to-llvm \
+    --convert-scf-to-cf \
+    --convert-arith-to-llvm \
+    --convert-cf-to-llvm \
+    --reconcile-unrealized-casts \
     --canonicalize \
     --cse \
     -o "$KERNEL_LLVM_MLIR"
 fi
 
 validate_no_triton_gpu_ops "$KERNEL_LLVM_MLIR"
+validate_no_triton_gpu_ops "$KERNEL_LLVM_MLIR"
+validate_no_unrealized_casts "$KERNEL_LLVM_MLIR"i
 
 log "[6/12] LLVM MLIR -> LLVM IR"
 run "$MLIR_TRANSLATE" \

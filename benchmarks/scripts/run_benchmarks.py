@@ -15,7 +15,7 @@ CSV_HEADER = [
     "m",
     "reps",
     "avg_seconds",
-    "gb_per_second",
+    "rate",
     "errors",
 ]
 
@@ -127,6 +127,14 @@ def collect_targets(build, include_cuda, include_openmp, include_openacc):
         "fnacc_matrix_add_2d",
         build / "benchmarks/fnacc/fnacc-matrix-add-2d/fnacc-matrix-add-2d",
     )
+    maybe_add(
+        targets_2d,
+        "matmul_2d",
+        "fnacc",
+        "fnacc_matmul_2d",
+        build / "benchmarks/fnacc/fnacc-matmul-2d/fnacc-matmul-2d",
+    )
+
 
     if include_cuda:
         maybe_add(
@@ -156,6 +164,13 @@ def collect_targets(build, include_cuda, include_openmp, include_openacc):
             "cuda",
             "cuda_matrix_add_2d",
             build / "benchmarks/cuda/cuda-matrix-add-2d",
+        )
+        maybe_add(
+            targets_2d,
+            "matmul_2d",
+            "cuda",
+            "cuda_matmul_2d",
+            build / "benchmarks/cuda/cuda-matmul-2d",
         )
 
     if include_openmp:
@@ -216,6 +231,13 @@ def collect_targets(build, include_cuda, include_openmp, include_openacc):
             "openacc",
             "openacc_matrix_add_2d",
             build / "benchmarks/openacc/openacc-matrix-add-2d",
+        )
+        maybe_add(
+            targets_2d,
+            "matmul_2d",
+            "openacc",
+            "openacc_matmul_2d",
+            build / "benchmarks/openacc/openacc-matmul-2d",
         )
 
     return targets_1d, targets_2d

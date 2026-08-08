@@ -27,6 +27,9 @@ option(FNACC_ENABLE_FNACC_BENCHMARKS
 option(FNACC_ENABLE_OPENMP_BASELINES
   "Build OpenMP CPU baselines" ON)
 
+option(FNACC_ENABLE_OPENMP_GPU_BASELINES
+  "Build OpenMP GPU offloading baselines" ON)
+
 option(FNACC_ENABLE_OPENACC_BASELINES
   "Build OpenACC baselines with nvfortran" OFF)
 
@@ -41,6 +44,9 @@ set(NVFORTRAN "" CACHE FILEPATH
 
 set(NVCC "" CACHE FILEPATH
   "Path to nvcc for CUDA baselines")
+
+set(OPENMP_GPU_OFFLOAD_FLAGS "-fopenmp-targets=nvptx64-nvidia-cuda" CACHE STRING
+  "Compiler flags for OpenMP target offloading (e.g. -fopenmp-targets=nvptx64-nvidia-cuda or -foffload=nvptx-none)")
 
 set(FNACC_NUM_WARPS "1" CACHE STRING
   "Number of Triton warps for FNACC-generated kernels")
@@ -63,7 +69,7 @@ if(FNACC_ENABLE_OPENACC_BASELINES AND NOT NVFORTRAN)
   find_program(NVFORTRAN nvfortran)
 endif()
 
-if(FNACC_ENABLE_OPENMP_BASELINES)
+if(FNACC_ENABLE_OPENMP_BASELINES OR FNACC_ENABLE_OPENMP_GPU_BASELINES)
   enable_language(Fortran OPTIONAL)
 endif()
 
@@ -140,6 +146,10 @@ if(FNACC_ENABLE_FNACC_BENCHMARKS)
   add_fnacc_benchmark(fnacc-matrix-add-2d
     matrix_add_2d_kernel.f90
     matrix_add_2d_main.f90)
+  
+  add_fnacc_benchmark(fnacc-matmul-2d
+    matmul_2d_kernel.f90
+    matmul_2d_main.f90)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -186,6 +196,57 @@ if(FNACC_ENABLE_OPENMP_BASELINES)
     add_openmp_benchmark(openmp-matrix-add-2d matrix_add_2d_openmp.f90)
   else()
     message(WARNING "OpenMP baselines requested but no Fortran compiler was found")
+  endif()
+endif()
+
+# -----------------------------------------------------------------------------
+# OpenMP GPU route
+# -----------------------------------------------------------------------------
+
+function(add_openmp_gpu_benchmark name source)
+  if(NOT CMAKE_Fortran_COMPILER)
+    message(WARNING "No Fortran compiler available; skipping ${name}")
+    return()
+  endif()
+
+  # Assuming you save the new GPU files in a directory called 'openmp_gpu'
+  set(source_path "${CMAKE_CURRENT_LIST_DIR}/openmp_gpu/${source}")
+
+  if(NOT EXISTS "${source_path}")
+    message(WARNING "OpenMP GPU benchmark source missing; skipping ${name}: ${source_path}")
+    return()
+  endif()
+
+  set(openmp_gpu_outdir "${CMAKE_CURRENT_BINARY_DIR}/openmp_gpu")
+  set(openmp_gpu_moddir "${CMAKE_CURRENT_BINARY_DIR}/openmp_gpu/mod/${name}")
+
+  add_executable("${name}"
+    "${BENCH_COMMON}"
+    "${source_path}")
+
+  # Separate OMP flags into a list if multiple are provided by the user
+  separate_arguments(OMP_OFFLOAD_LIST UNIX_COMMAND "${OPENMP_GPU_OFFLOAD_FLAGS}")
+
+  target_compile_options("${name}" PRIVATE -O3 -fopenmp ${OMP_OFFLOAD_LIST})
+  target_link_options("${name}" PRIVATE -fopenmp ${OMP_OFFLOAD_LIST})
+
+  target_include_directories("${name}" PRIVATE "${openmp_gpu_moddir}")
+
+  set_target_properties("${name}" PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${openmp_gpu_outdir}"
+    Fortran_MODULE_DIRECTORY "${openmp_gpu_moddir}")
+
+  set(ALL_BENCHMARK_TARGETS ${ALL_BENCHMARK_TARGETS} "${name}" PARENT_SCOPE)
+endfunction()
+
+if(FNACC_ENABLE_OPENMP_GPU_BASELINES)
+  if(CMAKE_Fortran_COMPILER)
+    add_openmp_gpu_benchmark(openmp-gpu-vector-add vector_add_openmp_gpu.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-saxpy saxpy_openmp_gpu.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-axpby axpby_openmp_gpu.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-matrix-add-2d matrix_add_2d_openmp_gpu.f90)
+  else()
+    message(WARNING "OpenMP GPU baselines requested but no Fortran compiler was found")
   endif()
 endif()
 
@@ -240,6 +301,7 @@ if(FNACC_ENABLE_OPENACC_BASELINES)
     add_openacc_benchmark(openacc-saxpy saxpy_openacc.f90)
     add_openacc_benchmark(openacc-axpby axpby_openacc.f90)
     add_openacc_benchmark(openacc-matrix-add-2d matrix_add_2d_openacc.f90)
+    add_openacc_benchmark(openacc-matmul-2d matmul_2d_openacc.f90)
   else()
     message(WARNING
       "OpenACC baselines requested but nvfortran was not found. "
@@ -283,6 +345,7 @@ if(FNACC_ENABLE_CUDA_BASELINES)
     add_cuda_benchmark(cuda-saxpy saxpy_cuda.cu)
     add_cuda_benchmark(cuda-axpby axpby_cuda.cu)
     add_cuda_benchmark(cuda-matrix-add-2d matrix_add_2d_cuda.cu)
+    add_cuda_benchmark(cuda-matmul-2d matmul_2d_cuda.cu)
   else()
     message(WARNING
       "CUDA baselines requested but nvcc was not found. "
@@ -303,4 +366,3 @@ else()
 endif()
 
 message(STATUS "FNACC benchmark targets: ${ALL_BENCHMARK_TARGETS}")
-

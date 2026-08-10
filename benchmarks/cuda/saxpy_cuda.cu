@@ -101,7 +101,9 @@ int main(int argc, char **argv) {
     for (int r = 0; r < reps; ++r)
       expected = alpha * x[i] + expected;
 
-    if (std::fabs(y[i] - expected) > 1.0e-3f) {
+    float tol = fmaxf(1.0e-4f, 1.0e-5f * fabsf(expected));
+    
+    if (std::fabs(y[i] - expected) > tol) {
       if (errors < 10) {
         std::fprintf(stderr, "mismatch at %lld: got %f expected %f\n", i + 1,
                      y[i], expected);

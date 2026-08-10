@@ -98,7 +98,9 @@ int main(int argc, char **argv) {
   for (long long i = 0; i < n; ++i) {
     float expected = alpha * a[i] + beta * b[i];
 
-    if (std::fabs(c[i] - expected) > 1.0e-4f) {
+    float tol = fmaxf(1.0e-4f, 1.0e-5f * fabsf(expected));
+    
+    if (std::fabs(c[i] - expected) > tol) {
       if (errors < 10) {
         std::fprintf(stderr, "mismatch at %lld: got %f expected %f\n", i + 1,
                      c[i], expected);

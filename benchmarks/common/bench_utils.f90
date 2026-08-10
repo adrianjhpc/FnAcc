@@ -1,15 +1,42 @@
 module bench_utils
+  use iso_c_binding, only: c_int, c_long, c_double
   implicit none
 
+  private
+  public :: parse_i64_arg, parse_i32_arg, print_result, almost_equal_f32, wall_time
+
+ type, bind(C) :: timespec
+    integer(c_long) :: tv_sec
+    integer(c_long) :: tv_nsec
+  end type timespec
+
+  interface
+    function clock_gettime(clk_id, tp) bind(C, name="clock_gettime") result(ierr)
+      import :: c_int, timespec
+      integer(c_int), value :: clk_id
+      type(timespec) :: tp
+      integer(c_int) :: ierr
+    end function clock_gettime
+  end interface
+
+integer(c_int), parameter :: fnacc_clock_monotonic = 1_c_int
+
+type, bind(C) :: c_timespec
+  integer(c_long) :: tv_sec
+  integer(c_long) :: tv_nsec
+end type c_timespec
+
+interface
+  function c_clock_gettime(clk_id, tp) bind(C, name="clock_gettime") result(ierr)
+    import :: c_int, c_timespec
+    integer(c_int), value :: clk_id
+    type(c_timespec) :: tp
+    integer(c_int) :: ierr
+  end function c_clock_gettime
+end interface
+
+
 contains
-
-  function wall_time() result(t)
-    real(8) :: t
-    integer :: count, rate
-
-    call system_clock(count, rate)
-    t = real(count, 8) / real(rate, 8)
-  end function
 
   subroutine parse_i64_arg(index, default_value, value)
     integer, intent(in) :: index
@@ -74,6 +101,20 @@ contains
 
     ok = diff <= tol
   end function
+
+  real(c_double) function wall_time()
+  type(c_timespec) :: ts
+  integer(c_int) :: ierr
+
+  ierr = c_clock_gettime(fnacc_clock_monotonic, ts)
+
+  if (ierr /= 0_c_int) then
+    wall_time = 0.0_c_double
+  else
+    wall_time = real(ts%tv_sec, c_double) + &
+                1.0e-9_c_double * real(ts%tv_nsec, c_double)
+  end if
+end function wall_time
 
 end module
 

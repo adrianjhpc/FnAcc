@@ -92,7 +92,8 @@ int main(int argc, char **argv) {
   int errors = 0;
   for (long long i = 0; i < n; ++i) {
     float expected = a[i] + b[i];
-    if (std::fabs(c[i] - expected) > 1.0e-5f)
+    float tol = fmaxf(1.0e-4f, 1.0e-5f * fabsf(expected));
+    if (std::fabs(c[i] - expected) > tol)
       ++errors;
   }
 

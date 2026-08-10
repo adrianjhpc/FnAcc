@@ -57,6 +57,13 @@ set(FNACC_THREADS_PER_WARP "32" CACHE STRING
 set(FNACC_NUM_STAGES "3" CACHE STRING
   "Triton pipeline stages")
 
+set(OPENACC_NVFORTRAN_FLAGS "-O3 -tp=zen3 -acc" CACHE STRING
+  "nvfortran flags for OpenACC baselines")
+
+set(OPENACC_GPU_FLAGS "-gpu=${OPENACC_GPU_ARCH}" CACHE STRING
+  "nvfortran GPU flags for OpenACC baselines")
+
+
 # -----------------------------------------------------------------------------
 # Tool discovery
 # -----------------------------------------------------------------------------
@@ -271,14 +278,16 @@ function(add_openacc_benchmark name source)
   set(workdir "${CMAKE_CURRENT_BINARY_DIR}/openacc")
   set(exe "${outdir}/${name}")
 
+  separate_arguments(OPENACC_NVFORTRAN_FLAGS_LIST UNIX_COMMAND "${OPENACC_NVFORTRAN_FLAGS}")
+  separate_arguments(OPENACC_GPU_FLAGS_LIST UNIX_COMMAND "${OPENACC_GPU_FLAGS}")
+
   add_custom_command(
     OUTPUT "${exe}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${outdir}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${workdir}"
     COMMAND "${NVFORTRAN}"
-      -O3
-      -acc
-      "-gpu=${OPENACC_GPU_ARCH}"
+      ${OPENACC_NVFORTRAN_FLAGS_LIST}
+      ${OPENACC_GPU_FLAGS_LIST}
       "${BENCH_COMMON}"
       "${source_path}"
       -o "${exe}"

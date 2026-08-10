@@ -18,8 +18,8 @@ program saxpy_openmp
   allocate(x(n), y(n), y0(n))
 
   do i = 1, n
-    x(i) = real(i)
-    y(i) = 10.0 + real(i)
+    x(i) = 0.001 * real(mod(i, 1000_8))
+    y(i) = 10.0 + 0.002 * real(mod(i, 1000_8))
     y0(i) = y(i)
   end do
 
@@ -28,28 +28,25 @@ program saxpy_openmp
     y(i) = alpha * x(i) + y(i)
   end do
 
-  do i = 1, n
-    y(i) = y0(i)
-  end do
+  y(:) = y0(:)
 
   t0 = wall_time()
+
   !$omp parallel private(r, i)
   do r = 1, reps
     !$omp do
     do i = 1, n
       y(i) = alpha * x(i) + y(i)
     end do
+    !$omp end do
   end do
   !$omp end parallel
+
   t1 = wall_time()
 
   errors = 0
   do i = 1, n
-    expected = y0(i)
-    do r = 1, reps
-      expected = alpha * x(i) + expected
-    end do
-
+    expected = y0(i) + real(reps) * alpha * x(i)
     if (.not. almost_equal_f32(y(i), expected)) errors = errors + 1
   end do
 

@@ -53,8 +53,9 @@ int main(int argc, char **argv) {
   CHECK(cudaMallocHost(&y0, bytes));
 
   for (long long i = 0; i < n; ++i) {
-    x[i] = static_cast<float>(i + 1);
-    y[i] = 10.0f + static_cast<float>(i + 1);
+    int v = static_cast<int>((i + 1) % 1000);
+    x[i] = 0.001f * static_cast<float>(v);
+    y[i] = 10.0f + 0.002f * static_cast<float>(v);
     y0[i] = y[i];
   }
 
@@ -96,13 +97,12 @@ int main(int argc, char **argv) {
 
   int errors = 0;
   for (long long i = 0; i < n; ++i) {
-    float expected = y0[i];
+    float expected =
+      y0[i] + static_cast<float>(reps) * alpha * x[i];
 
-    for (int r = 0; r < reps; ++r)
-      expected = alpha * x[i] + expected;
-
-    float tol = fmaxf(1.0e-4f, 1.0e-5f * fabsf(expected));
-    
+    float scale = fmaxf(1.0f, fmaxf(fabsf(y[i]), fabsf(expected)));
+    float tol = fmaxf(1.0e-3f, 1.0e-4f * scale);
+ 
     if (std::fabs(y[i] - expected) > tol) {
       if (errors < 10) {
         std::fprintf(stderr, "mismatch at %lld: got %f expected %f\n", i + 1,

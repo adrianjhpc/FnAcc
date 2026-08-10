@@ -25,7 +25,7 @@ program saxpy_openmp_gpu
   end do
 
   ! Warm-up execution on the GPU
-  !$omp target data map(to: x(1:n), y(1:n)) map(from: y(1:n))
+  !$omp target data map(to: x(1:n), alpha) map(from: y(1:n))
   !$omp target teams distribute parallel do
   do i = 1, n
     y(i) = alpha * x(i) + y(i)
@@ -38,7 +38,7 @@ program saxpy_openmp_gpu
   end do
 
   ! Map 'x' and 'y' to the device, and retrieve 'y' at the end.
-  !$omp target data map(to: x(1:n), y(1:n), alpha) map(from: y(1:n))
+  !$omp target data map(to: x(1:n), alpha) map(from: y(1:n))
   
   t0 = wall_time()
   

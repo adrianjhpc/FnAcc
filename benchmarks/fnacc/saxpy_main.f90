@@ -21,8 +21,8 @@ program saxpy_fnacc
   allocate(x(n), y(n), y0(n))
 
   do i = 1, n
-    x(i) = real(i)
-    y(i) = 10.0 + real(i)
+    x(i) = 0.001 * real(mod(i, 1000_8))
+    y(i) = 10.0 + 0.002 * real(mod(i, 1000_8))
     y0(i) = y(i)
   end do
 
@@ -31,9 +31,7 @@ program saxpy_fnacc
   call saxpy_compute(alpha, x, y)
   call saxpy_fetch(y)
 
-  do i = 1, n
-    y(i) = y0(i)
-  end do
+  y(:) = y0(:)
   call saxpy_prepare(x, y)
 
   t0 = wall_time()
@@ -46,10 +44,7 @@ program saxpy_fnacc
 
   errors = 0
   do i = 1, n
-    expected = y0(i)
-    do r = 1, reps
-      expected = alpha * x(i) + expected
-    end do
+    expected = y0(i) + real(reps) * alpha * x(i)
     if (.not. almost_equal_f32(y(i), expected)) errors = errors + 1
   end do
 

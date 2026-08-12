@@ -600,6 +600,7 @@ log "effective warps: $EFFECTIVE_NUM_WARPS"
 log "[4/12] TTIR -> TTGIR"
 run "$TRITON_OPT" "$TTIR" \
   "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$EFFECTIVE_NUM_WARPS" \
+  --tritongpu-accelerate-matmul \
   --canonicalize \
   --cse \
   -o "$TTGIR"
@@ -619,6 +620,7 @@ else
     --tritongpu-optimize-thread-locality \
     --triton-nvidia-gpu-plan-cta \
     --tritongpu-allocate-warp-groups \
+    --triton-nvidia-mma-lowering \
     --allocate-shared-memory-nv \
     --convert-scf-to-cf \
     --canonicalize \

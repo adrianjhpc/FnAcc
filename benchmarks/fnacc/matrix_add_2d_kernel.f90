@@ -13,7 +13,7 @@ contains
     real :: a(:, :), b(:, :), c(:, :)
     integer :: i, j
 
-    !$fnacc parallel tile(16, 16) pack(a:device, b:device, c:device)
+    !$fnacc parallel tile(32, 32) pack(a:device, b:device, c:device)
     do j = 1, size(c, 2)
       do i = 1, size(c, 1)
         c(i, j) = a(i, j) + b(i, j)

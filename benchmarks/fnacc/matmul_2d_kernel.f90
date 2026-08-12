@@ -14,7 +14,7 @@ contains
     integer :: i, j, p
     real :: acc
 
-    !$fnacc parallel tile(16, 16, 32) pack(a:device, b:device, c:device)
+    !$fnacc parallel tile(64, 64, 32) pack(a:device, b:device, c:device)
     do j = 1, size(c, 2)
       do i = 1, size(c, 1)
         acc = 0.0

@@ -19,38 +19,42 @@ program saxpy_openmp_gpu
 
   ! Initialize data on the host
   do i = 1, n
-    x(i) = real(i)
-    y(i) = 10.0 + real(i)
+    x(i) = 0.001 * real(mod(i, 1000_8))
+    y(i) = 10.0 + 0.002 * real(mod(i, 1000_8))
     y0(i) = y(i)
   end do
 
-  ! Warm-up execution on the GPU
-  !$omp target data map(to: x(1:n), alpha) map(from: y(1:n))
+  ! Warm-up execution on the GPU.
+  ! y is read and written, so use tofrom.
+  !$omp target data map(to: x(1:n), alpha) map(tofrom: y(1:n))
   !$omp target teams distribute parallel do
   do i = 1, n
     y(i) = alpha * x(i) + y(i)
   end do
+  !$omp end target teams distribute parallel do
   !$omp end target data
 
-  ! Reset 'y' back to initial state on the CPU
+  ! Reset y back to initial state on the CPU
   do i = 1, n
     y(i) = y0(i)
   end do
 
-  ! Map 'x' and 'y' to the device, and retrieve 'y' at the end.
-  !$omp target data map(to: x(1:n), alpha) map(from: y(1:n))
-  
+  ! Timed execution.
+  ! y must be copied to the device initially because the kernel reads y(i).
+  !$omp target data map(to: x(1:n)) map(tofrom: y(1:n))
+
   t0 = wall_time()
-  
+
   do r = 1, reps
-    !$omp target teams distribute parallel do
+    !$omp target teams distribute parallel do firstprivate(alpha, n)
     do i = 1, n
       y(i) = alpha * x(i) + y(i)
     end do
+    !$omp end target teams distribute parallel do
   end do
-  
+
   t1 = wall_time()
-  
+
   !$omp end target data
 
   errors = 0
@@ -68,3 +72,4 @@ program saxpy_openmp_gpu
 
   call print_result("openmp_target_saxpy", n, 1_8, reps, elapsed, bytes_per_rep, errors)
 end program
+

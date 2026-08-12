@@ -202,9 +202,24 @@ def parse_matrix_sizes(text):
 
     return result
 
+def parse_cublas_modes(text):
+    result = []
+    for item in text.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item not in {"tf32", "fp32"}:
+            raise ValueError(
+                f"invalid cuBLAS mode '{item}'; expected 'tf32' or 'fp32'"
+            )
+        result.append(item)
+    return result
 
-def maybe_add(targets, benchmark, backend, name, exe):
+def maybe_add(targets, benchmark, backend, name, exe, extra_args=None):
     chosen_exe, uses_runner = choose_exe(exe, backend)
+
+    if extra_args is None:
+        extra_args = []
 
     if is_executable(chosen_exe):
         targets.append(
@@ -215,6 +230,7 @@ def maybe_add(targets, benchmark, backend, name, exe):
                 "exe": chosen_exe,
                 "direct_exe": exe,
                 "uses_runner": uses_runner,
+                "extra_args": list(extra_args),
             }
         )
     else:
@@ -223,10 +239,11 @@ def maybe_add(targets, benchmark, backend, name, exe):
             f"{chosen_exe}"
         )
 
-
 def collect_targets(
     build,
     include_cuda,
+    include_cublas,
+    cublas_modes,
     include_openmp,
     include_openmp_gpu,
     include_openacc,
@@ -314,6 +331,21 @@ def collect_targets(
             "cuda_matmul_2d",
             build / "benchmarks/cuda/cuda-matmul-2d",
         )
+
+    # ------------------------------------------------------------------ #
+    # CUDA cuBLAS
+    # ------------------------------------------------------------------ #
+
+    if include_cublas:
+        for mode in cublas_modes:
+            maybe_add(
+                targets_2d,
+                "matmul_2d",
+                "cuda_cublas",
+                f"cuda_cublas_matmul_2d_{mode}",
+                build / "benchmarks/cuda/cuda-matmul-2d-cublas",
+                extra_args=[mode],
+            )
 
     # ------------------------------------------------------------------ #
     # OpenMP CPU
@@ -474,7 +506,12 @@ def build_tasks(
                     {
                         "kind": "1d",
                         "target": target,
-                        "cmd": [str(target["exe"]), str(size), str(reps)],
+                        "cmd": [
+                            str(target["exe"]),
+                            str(size),
+                            str(reps),
+                            *target.get("extra_args", []),
+                        ],
                     }
                 )
 
@@ -490,6 +527,7 @@ def build_tasks(
                             str(n),
                             str(m),
                             str(matrix_reps),
+                            *target.get("extra_args", []),
                         ],
                     }
                 )
@@ -549,6 +587,15 @@ def main():
     parser.add_argument("--matrix-reps", default=None)
 
     parser.add_argument("--include-cuda", action="store_true")
+    parser.add_argument("--include-cublas", action="store_true")
+    parser.add_argument(
+        "--cublas-modes",
+        default="tf32,fp32",
+        help=(
+            "Comma-separated cuBLAS matmul modes to run. "
+            "Valid values: tf32,fp32. Default: tf32,fp32."
+        ),
+    )
     parser.add_argument("--include-openmp", action="store_true")
     parser.add_argument("--include-openmp-gpu", action="store_true")
     parser.add_argument("--include-openacc", action="store_true")
@@ -562,7 +609,7 @@ def main():
         default=[],
         help=(
             "Run only this backend. May be repeated. "
-            "Examples: fnacc, cuda, openmp, openmp_gpu, openacc."
+            "Examples: fnacc, cuda, coda_cublas, openmp, openmp_gpu, openacc."
         ),
     )
     parser.add_argument(
@@ -614,10 +661,13 @@ def main():
     matrix_sizes = parse_matrix_sizes(args.matrix_sizes)
     reps = int(args.reps)
     matrix_reps = int(args.matrix_reps) if args.matrix_reps else reps
+    cublas_modes = parse_cublas_modes(args.cublas_modes)
 
     targets_1d, targets_2d = collect_targets(
         build,
         include_cuda=args.include_cuda,
+        include_cublas=args.include_cublas,
+        cublas_modes=cublas_modes,
         include_openmp=args.include_openmp,
         include_openmp_gpu=args.include_openmp_gpu,
         include_openacc=args.include_openacc,
@@ -638,23 +688,29 @@ def main():
         print("1-D targets:")
         for target in targets_1d:
             mode = "runner" if target.get("uses_runner", False) else "direct"
+            extra = " ".join(target.get("extra_args", []))
+            extra_suffix = f" {extra}" if extra else ""
+
             print(
-                f"  {target['backend']:12s} "
-                f"{target['benchmark']:16s} "
-                f"{target['name']:28s} "
-                f"{mode:8s} "
-                f"{target['exe']}"
+              f"  {target['backend']:12s} "
+              f"{target['benchmark']:16s} "
+              f"{target['name']:32s} "
+              f"{mode:8s} "
+              f"{target['exe']}{extra_suffix}"
             )
 
         print("2-D targets:")
         for target in targets_2d:
             mode = "runner" if target.get("uses_runner", False) else "direct"
+            extra = " ".join(target.get("extra_args", []))            
+            extra_suffix = f" {extra}" if extra else ""
+
             print(
-                f"  {target['backend']:12s} "
-                f"{target['benchmark']:16s} "
-                f"{target['name']:28s} "
-                f"{mode:8s} "
-                f"{target['exe']}"
+              f"  {target['backend']:12s} "
+              f"{target['benchmark']:16s} "
+              f"{target['name']:32s} "
+              f"{mode:8s} "
+              f"{target['exe']}{extra_suffix}"
             )
 
         return

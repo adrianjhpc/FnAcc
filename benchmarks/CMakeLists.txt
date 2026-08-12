@@ -201,6 +201,7 @@ if(FNACC_ENABLE_OPENMP_BASELINES)
     add_openmp_benchmark(openmp-saxpy saxpy_openmp.f90)
     add_openmp_benchmark(openmp-axpby axpby_openmp.f90)
     add_openmp_benchmark(openmp-matrix-add-2d matrix_add_2d_openmp.f90)
+    add_openmp_benchmark(openmp-matmul-2d matmul_2d_openmp.f90)
   else()
     message(WARNING "OpenMP baselines requested but no Fortran compiler was found")
   endif()
@@ -252,6 +253,7 @@ if(FNACC_ENABLE_OPENMP_GPU_BASELINES)
     add_openmp_gpu_benchmark(openmp-gpu-saxpy saxpy_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-axpby axpby_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-matrix-add-2d matrix_add_2d_openmp_gpu.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-matmul-2d matmul_2d_openmp.f90)
   else()
     message(WARNING "OpenMP GPU baselines requested but no Fortran compiler was found")
   endif()
@@ -361,6 +363,44 @@ if(FNACC_ENABLE_CUDA_BASELINES)
       "Configure with -DNVCC=/path/to/nvcc")
   endif()
 endif()
+
+function(add_cuda_cublas_benchmark name source)
+  if(NOT NVCC)
+    message(WARNING "nvcc not found; skipping ${name}")
+    return()
+  endif()
+
+  set(outdir "${CMAKE_CURRENT_BINARY_DIR}/cuda")
+  set(exe "${outdir}/${name}")
+
+  add_custom_command(
+    OUTPUT "${exe}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${outdir}"
+    COMMAND "${NVCC}"
+      -O3
+      "-arch=${CUDA_ARCH}"
+      "${CMAKE_CURRENT_LIST_DIR}/cuda/${source}"
+      -lcublas
+      -o "${exe}"
+    DEPENDS "${CMAKE_CURRENT_LIST_DIR}/cuda/${source}"
+    COMMENT "Building CUDA cuBLAS benchmark ${name}"
+    VERBATIM
+  )
+
+  add_custom_target("${name}" DEPENDS "${exe}")
+  set(ALL_BENCHMARK_TARGETS ${ALL_BENCHMARK_TARGETS} "${name}" PARENT_SCOPE)
+endfunction()
+
+if(FNACC_ENABLE_CUDA_BASELINES)
+  if(NVCC)
+    add_cuda_cublas_benchmark(cuda-matmul-2d-cublas matmul_2d_cublas.cu)
+  else()
+    message(WARNING
+      "CUDA baselines requested but nvcc was not found. "
+      "Configure with -DNVCC=/path/to/nvcc")
+  endif()
+endif()
+
 
 # -----------------------------------------------------------------------------
 # Aggregate target

@@ -421,6 +421,14 @@ def collect_targets(
             "openmp_gpu_matrix_add_2d",
             build / "benchmarks/openmp_gpu/openmp-gpu-matrix-add-2d",
         )
+        maybe_add(
+            targets_2d,
+            "matmul_2d",
+            "openmp_gpu",
+            "openmp_gpu_matmul_2d",
+            build / "benchmarks/openmp_gpu/openmp-gpu-matmul-2d",
+        )
+
 
     # ------------------------------------------------------------------ #
     # OpenACC

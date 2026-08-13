@@ -15,16 +15,43 @@ Options:
   --extra-src FILE         Additional non-FNACC Fortran source. May be repeated.
   --base NAME              Base name for intermediate files
   --workdir DIR            Directory for intermediate files
-  --sm NUM                 CUDA SM version, e.g. 80, 90
+  --sm NUM                 CUDA SM version, e.g. 80, 90, sm_80, cc80
+
+  --num-warps N            Number of Triton warps, default FNACC_NUM_WARPS or 1
+  --threads-per-warp N     Threads per warp, default FNACC_THREADS_PER_WARP or 32
+  --num-stages N           Triton pipeline stages, default FNACC_NUM_STAGES or 3
+
   -I DIR                   Add Fortran include/module search directory
   -J DIR                   Add Fortran module output/search directory
   --fflag FLAG             Extra flag passed to flang-new compile steps. May repeat.
   --ldflag FLAG            Extra linker flag. May repeat.
   --lib LIB                Extra library, e.g. --lib m means -lm. May repeat.
-  --keep                  Keep intermediate files
-  --verbose               Print commands before running them
-  --dry-run               Print commands but do not run them
-  -h, --help              Show this help
+
+  --cuda-lib-dir DIR       CUDA driver library directory, default CUDA_LIB_DIR or /usr/local/cuda/lib64
+
+  --no-embed               Do not embed PTX/JSON. Runner will use external files.
+  --runner-uses-files      Embed PTX/JSON, but generated .run wrapper forces external files.
+                           Useful for debugging stale embedded payloads.
+
+  --stop-after STAGE       Stop after a stage and keep intermediates.
+                           Stages:
+                             modgen
+                             fir
+                             fnacc-pipeline
+                             ttgir
+                             llvm-mlir
+                             llvm-ir
+                             ptx
+                             embed
+                             host-ll
+                             host-obj
+                             objects
+                             link
+
+  --keep                   Keep intermediate files
+  --verbose                Print commands before running them
+  --dry-run                Print commands but do not run them
+  -h, --help               Show this help
 
 Environment:
   LLVM_BUILD               llvm-project build directory
@@ -34,19 +61,38 @@ Environment:
   CUDA_LIB_DIR             CUDA library directory, default /usr/local/cuda/lib64
 
 Optional environment:
-  FNACC_NUM_WARPS          number of warps to use, defaults to 1.
+  FNACC_NUM_WARPS          number of warps to use, defaults to 1
+  FNACC_THREADS_PER_WARP   threads per warp, defaults to 32
+  FNACC_NUM_STAGES         number of Triton pipeline stages, defaults to 3
   FNACC_SM                 default CUDA SM, default 80
-  FNACC_WORKDIR            default work directory, default current directory
+  FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
   FLANG                    override flang-new
   FIROPT                   override fir-opt
   TCO                      override tco
   CLANG                    override clang
+
+Advanced environment:
+  FNACC_TTGIR_TO_LLVM_PASSES
+                           Override TTGIR -> LLVM MLIR pass pipeline.
+                           Parsed with shell-like quoting.
+  FNACC_TTIR_TO_TTGIR_PASSES
+                           Override TTIR -> TTGIR pass pipeline.
+                           Parsed with shell-like quoting.
+  FNACC_PATCH_TTG_WARP_ID  Patch residual ttg.warp_id with NVPTX inline asm.
+                           Default: 1
+  FNACC_ALLOW_EMPTY_KERNELS
+                           Allow no recognized kernels in generated JSON.
+                           Default: 0
 EOF
 }
 
 die() {
   echo "fnacc-flang: error: $*" >&2
   exit 1
+}
+
+warn() {
+  echo "fnacc-flang: warning: $*" >&2
 }
 
 log() {
@@ -80,6 +126,28 @@ abspath() {
   python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
+hash_path() {
+  python3 -c 'import hashlib,os,sys; print(hashlib.sha1(os.path.abspath(sys.argv[1]).encode()).hexdigest()[:8])' "$1"
+}
+
+object_for_src() {
+  local src="$1"
+  local stem hash
+  stem="$(basename "$src")"
+  stem="${stem%.*}"
+  hash="$(hash_path "$src")"
+  echo "$OBJ_DIR/${stem}_${hash}.o"
+}
+
+maybe_stop() {
+  local stage="$1"
+  if [[ "$STOP_AFTER" == "$stage" ]]; then
+    log "stopping after stage: $stage"
+    log "workdir kept: $WORKDIR"
+    exit 0
+  fi
+}
+
 generate_embedded_c() {
   local ptx_file="$1"
   local json_file="$2"
@@ -98,7 +166,7 @@ json = json_path.read_bytes()
 
 def emit_array(name, data):
     lines = []
-    lines.append(f"static const unsigned char {name}[] = {{")
+    lines.append(f"static const unsigned char {name}[] __attribute__((aligned(16))) = {{")
     for i in range(0, len(data), 12):
         chunk = data[i:i + 12]
         line = "  " + ", ".join(f"0x{b:02x}" for b in chunk) + ","
@@ -131,227 +199,34 @@ out_path.write_text(content)
 PY
 }
 
+validate_json() {
+  local json_file="$1"
+  python3 -m json.tool "$json_file" >/dev/null || die "invalid JSON: $json_file"
+}
 
-KERNEL_SRC=""
-MAIN_SRCS=()
-EXTRA_SRCS=()
-EXE=""
-BASE=""
-WORKDIR="${FNACC_WORKDIR:-.}"
-SM="${FNACC_SM:-80}"
-NUM_WARPS="${FNACC_NUM_WARPS:-1}"
-THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-32}"
-NUM_STAGES="${FNACC_NUM_STAGES:-3}"
-KEEP=0
-VERBOSE=0
-DRY_RUN=0
+validate_kernel_json_nonempty() {
+  local json_file="$1"
 
-INCLUDE_DIRS=()
-MODULE_DIRS=()
-FFLAGS=()
-LDFLAGS=()
-LIBS=()
+  if [[ "${FNACC_ALLOW_EMPTY_KERNELS:-0}" == "1" ]]; then
+    return
+  fi
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --kernel-src)
-      [[ $# -ge 2 ]] || die "--kernel-src requires an argument"
-      KERNEL_SRC="$2"
-      shift 2
-      ;;
-    --main-src)
-      [[ $# -ge 2 ]] || die "--main-src requires an argument"
-      MAIN_SRCS+=("$2")
-      shift 2
-      ;;
-    --extra-src)
-      [[ $# -ge 2 ]] || die "--extra-src requires an argument"
-      EXTRA_SRCS+=("$2")
-      shift 2
-      ;;
-    -o|--output)
-      [[ $# -ge 2 ]] || die "$1 requires an argument"
-      EXE="$2"
-      shift 2
-      ;;
-    --base)
-      [[ $# -ge 2 ]] || die "--base requires an argument"
-      BASE="$2"
-      shift 2
-      ;;
-    --workdir)
-      [[ $# -ge 2 ]] || die "--workdir requires an argument"
-      WORKDIR="$2"
-      shift 2
-      ;;
-    --sm)
-      [[ $# -ge 2 ]] || die "--sm requires an argument"
-      SM="$2"
-      shift 2
-      ;;
-    -I)
-      [[ $# -ge 2 ]] || die "-I requires an argument"
-      INCLUDE_DIRS+=("$2")
-      shift 2
-      ;;
-    -J)
-      [[ $# -ge 2 ]] || die "-J requires an argument"
-      MODULE_DIRS+=("$2")
-      shift 2
-      ;;
-    --fflag)
-      [[ $# -ge 2 ]] || die "--fflag requires an argument"
-      FFLAGS+=("$2")
-      shift 2
-      ;;
-    --ldflag)
-      [[ $# -ge 2 ]] || die "--ldflag requires an argument"
-      LDFLAGS+=("$2")
-      shift 2
-      ;;
-    --lib)
-      [[ $# -ge 2 ]] || die "--lib requires an argument"
-      LIBS+=("-l$2")
-      shift 2
-      ;;
-    --keep)
-      KEEP=1
-      shift
-      ;;
-    --verbose)
-      VERBOSE=1
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      die "unknown argument: $1"
-      ;;
-  esac
-done
+  python3 - "$json_file" <<'PY'
+import json
+import sys
 
-[[ -n "$KERNEL_SRC" ]] || die "missing --kernel-src"
-[[ ${#MAIN_SRCS[@]} -gt 0 ]] || die "missing at least one --main-src"
-[[ -n "$EXE" ]] || die "missing -o/--output"
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
 
-require_file "$KERNEL_SRC"
-for src in "${MAIN_SRCS[@]}"; do require_file "$src"; done
-for src in "${EXTRA_SRCS[@]}"; do require_file "$src"; done
-
-SM="${SM#sm_}"
-SM="${SM#cc}"
-
-if ! [[ "$SM" =~ ^[0-9]+$ ]]; then
-  die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, or cc80"
-fi
-
-if ! [[ "$NUM_WARPS" =~ ^[0-9]+$ ]]; then
-  die "invalid FNACC_NUM_WARPS value '$NUM_WARPS'; expected integer"
-fi
-
-if ! [[ "$THREADS_PER_WARP" =~ ^[0-9]+$ ]]; then
-  die "invalid FNACC_THREADS_PER_WARP value '$THREADS_PER_WARP'; expected integer"
-fi
-
-if ! [[ "$NUM_STAGES" =~ ^[0-9]+$ ]]; then
-  die "invalid FNACC_NUM_STAGES value '$NUM_STAGES'; expected integer"
-fi
-
-log "cuda sm:       sm_$SM"
-log "triton warps:  $NUM_WARPS"
-log "threads/warp:  $THREADS_PER_WARP"
-log "triton stages: $NUM_STAGES"
-
-LLVM_BUILD="${LLVM_BUILD:-}"
-[[ -n "$LLVM_BUILD" ]] || die "LLVM_BUILD is not set"
-
-FLANG="${FLANG:-$LLVM_BUILD/bin/flang-new}"
-FIROPT="${FIROPT:-$LLVM_BUILD/bin/fir-opt}"
-TCO="${TCO:-$LLVM_BUILD/bin/tco}"
-CLANG="${CLANG:-$LLVM_BUILD/bin/clang}"
-
-TRITON_OPT="${TRITON_OPT:-}"
-MLIR_TRANSLATE="${MLIR_TRANSLATE:-}"
-LLC="${LLC:-}"
-CUDA_LIB_DIR="${CUDA_LIB_DIR:-/usr/local/cuda/lib64}"
-
-[[ -n "$TRITON_OPT" ]] || die "TRITON_OPT is not set"
-[[ -n "$MLIR_TRANSLATE" ]] || die "MLIR_TRANSLATE is not set"
-[[ -n "$LLC" ]] || die "LLC is not set"
-
-require_exe "$FLANG"
-require_exe "$FIROPT"
-require_exe "$TCO"
-require_exe "$CLANG"
-require_exe "$TRITON_OPT"
-require_exe "$MLIR_TRANSLATE"
-require_exe "$LLC"
-
-mkdir -p "$WORKDIR"
-
-if [[ -z "$BASE" ]]; then
-  BASE="$(basename "$EXE")"
-fi
-
-BASE_PATH="$WORKDIR/$BASE"
-MOD_DIR="$WORKDIR/mod"
-OBJ_DIR="$WORKDIR/obj"
-
-# Fortran .mod files are compiler-specific. Always clean the wrapper's private
-# module/object directories to avoid accidentally consuming a stale module file
-# produced by gfortran, nvfortran, or another Flang build.
-rm -rf "$MOD_DIR" "$OBJ_DIR"
-mkdir -p "$MOD_DIR" "$OBJ_DIR"
-
-# Always include our generated module directory.
-INCLUDE_FLAGS=("-I" "$MOD_DIR")
-MODULE_FLAGS=("-J" "$MOD_DIR")
-
-for dir in "${INCLUDE_DIRS[@]}"; do
-  INCLUDE_FLAGS+=("-I" "$dir")
-done
-
-for dir in "${MODULE_DIRS[@]}"; do
-  MODULE_FLAGS+=("-J" "$dir")
-  INCLUDE_FLAGS+=("-I" "$dir")
-done
-
-FIR="$BASE_PATH.fir"
-HOST_FIR="$BASE_PATH.host.fir"
-HOST_LL="$BASE_PATH.host.ll"
-HOST_OBJ="$BASE_PATH.host.o"
-
-TTIR="$BASE_PATH.kernels.ttir"
-JSON="$BASE_PATH.kernels.json"
-TTGIR="$BASE_PATH.kernels.ttgir.mlir"
-KERNEL_LLVM_MLIR="$BASE_PATH.kernels.llvm.mlir"
-KERNEL_LL="$BASE_PATH.kernels.ll"
-PTX="$BASE_PATH.kernels.ptx"
-
-EMBED_C="$BASE_PATH.embedded.c"
-EMBED_OBJ="$BASE_PATH.embedded.o"
-
-MODGEN_OBJ="$OBJ_DIR/$BASE.modgen.o"
-
-MAIN_OBJS=()
-for src in "${MAIN_SRCS[@]}"; do
-  stem="$(basename "$src")"
-  stem="${stem%.*}"
-  MAIN_OBJS+=("$OBJ_DIR/$stem.o")
-done
-
-EXTRA_OBJS=()
-for src in "${EXTRA_SRCS[@]}"; do
-  stem="$(basename "$src")"
-  stem="${stem%.*}"
-  EXTRA_OBJS+=("$OBJ_DIR/$stem.o")
-done
+kernels = data.get("kernels", [])
+if not kernels:
+    print(f"fnacc-flang: error: no kernels were emitted into {path}", file=sys.stderr)
+    print("This usually means no FNACC launch was recognized.", file=sys.stderr)
+    print("Set FNACC_ALLOW_EMPTY_KERNELS=1 to allow this.", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
 
 validate_no_triton_gpu_ops() {
   local file="$1"
@@ -362,17 +237,6 @@ validate_no_triton_gpu_ops() {
   ttg_left="$(mktemp)"
   tt_left="$(mktemp)"
 
-  # Match actual TritonGPU operations, not module attributes.
-  #
-  # Catches:
-  #   %12 = ttg.warp_id ...
-  #   ttg.some_op ...
-  #   %0 = "ttg.some_op"(...)
-  #   "ttg.some_op"(...)
-  #
-  # Does not catch:
-  #   module attributes {"ttg.num-warps" = ...}
-  #   ttg.target = "cuda:80" inside an attribute dictionary
   grep -nE '^[[:space:]]*((%[A-Za-z0-9_.$#-]+[[:space:]]*=[[:space:]]*)?)("?ttg\.)' \
     "$file" > "$ttg_left" || true
 
@@ -381,19 +245,11 @@ validate_no_triton_gpu_ops() {
     head -20 "$ttg_left" >&2
     echo >&2
     echo "This usually means the Triton pass pipeline did not fully lower TTGIR." >&2
-    echo "If using multi-warp lowering, try FNACC_NUM_WARPS=1 or set FNACC_TTGIR_TO_LLVM_PASSES." >&2
+    echo "If using multi-warp lowering, try --num-warps 1 or set FNACC_TTGIR_TO_LLVM_PASSES." >&2
     rm -f "$ttg_left" "$tt_left"
     exit 1
   fi
 
-  # Match actual Triton operations, not attributes.
-  #
-  # Catches:
-  #   %0 = tt.load ...
-  #   tt.store ...
-  #   %0 = "tt.load"(...)
-  #
-  # Avoids matching words containing "tt." elsewhere.
   grep -nE '^[[:space:]]*((%[A-Za-z0-9_.$#-]+[[:space:]]*=[[:space:]]*)?)("?tt\.)' \
     "$file" > "$tt_left" || true
 
@@ -438,13 +294,6 @@ import sys
 inp = sys.argv[1]
 out = sys.argv[2]
 
-# Matches lines such as:
-#
-#   %67 = ttg.warp_id {omitUniformHint}
-#   %67 = ttg.warp_id
-#   %67 = ttg.warp_id {omitUniformHint} : i32
-#
-# after TritonGPU-to-LLVM lowering has otherwise completed.
 pat = re.compile(
     r'^(\s*)(%[A-Za-z0-9_.$#-]+)\s*=\s*ttg\.warp_id'
     r'(?:\s*\{[^}]*\})?'
@@ -462,13 +311,6 @@ with open(inp, "r", encoding="utf-8") as f, open(out, "w", encoding="utf-8") as 
             continue
 
         indent, name = m.groups()
-
-        # NVPTX special register %warpid.
-        #
-        # This is deliberately done after TritonGPU-to-LLVM conversion, where
-        # the result is an ordinary i32 value used by already-lowered LLVM/NVVM
-        # code. It avoids depending on Triton's internal ttg.warp_id lowering,
-        # which varies between Triton versions.
         g.write(
             f'{indent}{name} = llvm.inline_asm has_side_effects '
             f'asm_dialect = att "mov.u32 $0, %warpid;", "=r" '
@@ -524,30 +366,323 @@ for k in kernels:
     except Exception:
         warps.append(fallback)
 
-# Current FNACC TTIR uses one module-wide warp count. If future kernels differ,
-# using max is conservative for the external triton-opt invocation.
 print(max(warps) if warps else fallback)
 PY
 }
 
+KERNEL_SRC=""
+MAIN_SRCS=()
+EXTRA_SRCS=()
+EXE=""
+BASE=""
+WORKDIR="${FNACC_WORKDIR:-}"
+USER_WORKDIR_SET=0
 
-log "kernel source: $KERNEL_SRC"
-log "main sources:  ${MAIN_SRCS[*]}"
-if [[ ${#EXTRA_SRCS[@]} -gt 0 ]]; then
-  log "extra sources: ${EXTRA_SRCS[*]}"
+SM="${FNACC_SM:-80}"
+NUM_WARPS="${FNACC_NUM_WARPS:-1}"
+THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-32}"
+NUM_STAGES="${FNACC_NUM_STAGES:-3}"
+
+KEEP=0
+VERBOSE=0
+DRY_RUN=0
+NO_EMBED=0
+RUNNER_USES_FILES=0
+STOP_AFTER=""
+
+INCLUDE_DIRS=()
+MODULE_DIRS=()
+FFLAGS=()
+LDFLAGS=()
+LIBS=()
+
+CUDA_LIB_DIR="${CUDA_LIB_DIR:-/usr/local/cuda/lib64}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kernel-src)
+      [[ $# -ge 2 ]] || die "--kernel-src requires an argument"
+      KERNEL_SRC="$2"
+      shift 2
+      ;;
+    --main-src)
+      [[ $# -ge 2 ]] || die "--main-src requires an argument"
+      MAIN_SRCS+=("$2")
+      shift 2
+      ;;
+    --extra-src)
+      [[ $# -ge 2 ]] || die "--extra-src requires an argument"
+      EXTRA_SRCS+=("$2")
+      shift 2
+      ;;
+    -o|--output)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      EXE="$2"
+      shift 2
+      ;;
+    --base)
+      [[ $# -ge 2 ]] || die "--base requires an argument"
+      BASE="$2"
+      shift 2
+      ;;
+    --workdir)
+      [[ $# -ge 2 ]] || die "--workdir requires an argument"
+      WORKDIR="$2"
+      USER_WORKDIR_SET=1
+      shift 2
+      ;;
+    --sm)
+      [[ $# -ge 2 ]] || die "--sm requires an argument"
+      SM="$2"
+      shift 2
+      ;;
+    --num-warps)
+      [[ $# -ge 2 ]] || die "--num-warps requires an argument"
+      NUM_WARPS="$2"
+      shift 2
+      ;;
+    --threads-per-warp)
+      [[ $# -ge 2 ]] || die "--threads-per-warp requires an argument"
+      THREADS_PER_WARP="$2"
+      shift 2
+      ;;
+    --num-stages)
+      [[ $# -ge 2 ]] || die "--num-stages requires an argument"
+      NUM_STAGES="$2"
+      shift 2
+      ;;
+    --cuda-lib-dir)
+      [[ $# -ge 2 ]] || die "--cuda-lib-dir requires an argument"
+      CUDA_LIB_DIR="$2"
+      shift 2
+      ;;
+    -I)
+      [[ $# -ge 2 ]] || die "-I requires an argument"
+      INCLUDE_DIRS+=("$2")
+      shift 2
+      ;;
+    -J)
+      [[ $# -ge 2 ]] || die "-J requires an argument"
+      MODULE_DIRS+=("$2")
+      shift 2
+      ;;
+    --fflag)
+      [[ $# -ge 2 ]] || die "--fflag requires an argument"
+      FFLAGS+=("$2")
+      shift 2
+      ;;
+    --ldflag)
+      [[ $# -ge 2 ]] || die "--ldflag requires an argument"
+      LDFLAGS+=("$2")
+      shift 2
+      ;;
+    --lib)
+      [[ $# -ge 2 ]] || die "--lib requires an argument"
+      LIBS+=("-l$2")
+      shift 2
+      ;;
+    --no-embed)
+      NO_EMBED=1
+      shift
+      ;;
+    --runner-uses-files)
+      RUNNER_USES_FILES=1
+      shift
+      ;;
+    --stop-after)
+      [[ $# -ge 2 ]] || die "--stop-after requires an argument"
+      STOP_AFTER="$2"
+      shift 2
+      ;;
+    --keep)
+      KEEP=1
+      shift
+      ;;
+    --verbose)
+      VERBOSE=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$KERNEL_SRC" ]] || die "missing --kernel-src"
+[[ ${#MAIN_SRCS[@]} -gt 0 ]] || die "missing at least one --main-src"
+[[ -n "$EXE" ]] || die "missing -o/--output"
+
+case "$STOP_AFTER" in
+  ""|modgen|fir|fnacc-pipeline|ttgir|llvm-mlir|llvm-ir|ptx|embed|host-ll|host-obj|objects|link)
+    ;;
+  *)
+    die "invalid --stop-after stage: $STOP_AFTER"
+    ;;
+esac
+
+require_file "$KERNEL_SRC"
+for src in "${MAIN_SRCS[@]}"; do require_file "$src"; done
+for src in "${EXTRA_SRCS[@]}"; do require_file "$src"; done
+
+SM="${SM#sm_}"
+SM="${SM#cc}"
+
+if ! [[ "$SM" =~ ^[0-9]+$ ]]; then
+  die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, or cc80"
 fi
-log "output:        $EXE"
-log "workdir:       $WORKDIR"
-log "module dir:    $MOD_DIR"
-log "base:          $BASE"
-log "cuda sm:       sm_$SM"
+
+if ! [[ "$NUM_WARPS" =~ ^[0-9]+$ ]]; then
+  die "invalid num-warps value '$NUM_WARPS'; expected integer"
+fi
+
+if ! [[ "$THREADS_PER_WARP" =~ ^[0-9]+$ ]]; then
+  die "invalid threads-per-warp value '$THREADS_PER_WARP'; expected integer"
+fi
+
+if ! [[ "$NUM_STAGES" =~ ^[0-9]+$ ]]; then
+  die "invalid num-stages value '$NUM_STAGES'; expected integer"
+fi
+
+if [[ "$NUM_WARPS" == "0" ]]; then
+  die "num-warps must be positive"
+fi
+
+if [[ "$THREADS_PER_WARP" == "0" ]]; then
+  die "threads-per-warp must be positive"
+fi
+
+if [[ "$NUM_STAGES" == "0" ]]; then
+  die "num-stages must be positive"
+fi
+
+LLVM_BUILD="${LLVM_BUILD:-}"
+[[ -n "$LLVM_BUILD" ]] || die "LLVM_BUILD is not set"
+
+FLANG="${FLANG:-$LLVM_BUILD/bin/flang-new}"
+FIROPT="${FIROPT:-$LLVM_BUILD/bin/fir-opt}"
+TCO="${TCO:-$LLVM_BUILD/bin/tco}"
+CLANG="${CLANG:-$LLVM_BUILD/bin/clang}"
+
+TRITON_OPT="${TRITON_OPT:-}"
+MLIR_TRANSLATE="${MLIR_TRANSLATE:-}"
+LLC="${LLC:-}"
+
+[[ -n "$TRITON_OPT" ]] || die "TRITON_OPT is not set"
+[[ -n "$MLIR_TRANSLATE" ]] || die "MLIR_TRANSLATE is not set"
+[[ -n "$LLC" ]] || die "LLC is not set"
+
+require_exe "$FLANG"
+require_exe "$FIROPT"
+require_exe "$TCO"
+require_exe "$CLANG"
+require_exe "$TRITON_OPT"
+require_exe "$MLIR_TRANSLATE"
+require_exe "$LLC"
+
+if [[ ! -d "$CUDA_LIB_DIR" ]]; then
+  warn "CUDA_LIB_DIR does not exist: $CUDA_LIB_DIR"
+fi
+
+if [[ ! -e "$CUDA_LIB_DIR/libcuda.so" && ! -e "$CUDA_LIB_DIR/libcuda.so.1" ]]; then
+  warn "libcuda.so was not found in CUDA_LIB_DIR=$CUDA_LIB_DIR; link may fail"
+fi
+
+if [[ -z "$WORKDIR" ]]; then
+  WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/fnacc-flang.XXXXXX")"
+else
+  USER_WORKDIR_SET=1
+fi
+
+if [[ -z "$BASE" ]]; then
+  BASE="$(basename "$EXE")"
+fi
+
+# If external files are required by the runner, the generated PTX/JSON must
+# remain available after the script exits.
+if [[ "$NO_EMBED" == "1" || "$RUNNER_USES_FILES" == "1" || -n "$STOP_AFTER" ]]; then
+  KEEP=1
+fi
+
+cleanup() {
+  if [[ "$KEEP" != "1" && "$DRY_RUN" != "1" && "$USER_WORKDIR_SET" == "0" ]]; then
+    rm -rf "$WORKDIR"
+  fi
+}
+trap cleanup EXIT
+
+mkdir -p "$WORKDIR"
+
+BASE_PATH="$WORKDIR/$BASE"
+MOD_DIR="$WORKDIR/mod"
+OBJ_DIR="$WORKDIR/obj"
+
+rm -rf "$MOD_DIR" "$OBJ_DIR"
+mkdir -p "$MOD_DIR" "$OBJ_DIR"
+
+INCLUDE_FLAGS=("-I" "$MOD_DIR")
+MODULE_FLAGS=("-J" "$MOD_DIR")
+
+for dir in "${INCLUDE_DIRS[@]}"; do
+  INCLUDE_FLAGS+=("-I" "$dir")
+done
+
+for dir in "${MODULE_DIRS[@]}"; do
+  MODULE_FLAGS+=("-J" "$dir")
+  INCLUDE_FLAGS+=("-I" "$dir")
+done
+
+FIR="$BASE_PATH.fir"
+HOST_FIR="$BASE_PATH.host.fir"
+HOST_LL="$BASE_PATH.host.ll"
+HOST_OBJ="$BASE_PATH.host.o"
+
+TTIR="$BASE_PATH.kernels.ttir"
+JSON="$BASE_PATH.kernels.json"
+TTGIR="$BASE_PATH.kernels.ttgir.mlir"
+KERNEL_LLVM_MLIR="$BASE_PATH.kernels.llvm.mlir"
+KERNEL_LL="$BASE_PATH.kernels.ll"
+PTX="$BASE_PATH.kernels.ptx"
+
+EMBED_C="$BASE_PATH.embedded.c"
+EMBED_OBJ="$BASE_PATH.embedded.o"
+
+MAIN_OBJS=()
+for src in "${MAIN_SRCS[@]}"; do
+  MAIN_OBJS+=("$(object_for_src "$src")")
+done
+
+EXTRA_OBJS=()
+for src in "${EXTRA_SRCS[@]}"; do
+  EXTRA_OBJS+=("$(object_for_src "$src")")
+done
+
+log "kernel source:     $KERNEL_SRC"
+log "main sources:      ${MAIN_SRCS[*]}"
+if [[ ${#EXTRA_SRCS[@]} -gt 0 ]]; then
+  log "extra sources:     ${EXTRA_SRCS[*]}"
+fi
+log "output:            $EXE"
+log "workdir:           $WORKDIR"
+log "module dir:        $MOD_DIR"
+log "base:              $BASE"
+log "cuda sm:           sm_$SM"
+log "triton warps:      $NUM_WARPS"
+log "threads/warp:      $THREADS_PER_WARP"
+log "triton stages:     $NUM_STAGES"
+log "embed kernels:     $([[ "$NO_EMBED" == "1" ]] && echo no || echo yes)"
+log "runner uses files: $([[ "$RUNNER_USES_FILES" == "1" || "$NO_EMBED" == "1" ]] && echo yes || echo no)"
+log "keep workdir:      $KEEP"
 
 # --------------------------------------------------------------------------- #
 # 1. Generate .mod files from the kernel source.
-#
-# This intentionally discards the object from ordinary compilation. The real
-# kernel object is produced by the FNACC FIR pipeline below. The .mod files are
-# needed so the main program can `use` modules defined by the kernel source.
 # --------------------------------------------------------------------------- #
 
 log "[1/12] Generate Fortran module files"
@@ -557,6 +692,7 @@ run "$FLANG" \
   "${MODULE_FLAGS[@]}" \
   "${FFLAGS[@]}"
 
+maybe_stop modgen
 
 # --------------------------------------------------------------------------- #
 # 2. Emit FIR for the FNACC kernel source.
@@ -568,6 +704,12 @@ run "$FLANG" \
   -emit-fir \
   "$KERNEL_SRC" \
   -o "$FIR"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$FIR" || die "FIR was not generated: $FIR"
+fi
+
+maybe_stop fir
 
 # --------------------------------------------------------------------------- #
 # 3. FNACC pipeline: TTIR/JSON + host runtime lowering.
@@ -583,27 +725,48 @@ if [[ "$DRY_RUN" != "1" ]]; then
   test -s "$TTIR" || die "TTIR was not generated: $TTIR"
   test -s "$JSON" || die "JSON was not generated: $JSON"
   test -s "$HOST_FIR" || die "host FIR was not generated: $HOST_FIR"
+  validate_json "$JSON"
+  validate_kernel_json_nonempty "$JSON"
 fi
 
 EFFECTIVE_NUM_WARPS="$NUM_WARPS"
-
 if [[ "$DRY_RUN" != "1" ]]; then
   EFFECTIVE_NUM_WARPS="$(read_effective_num_warps_from_json "$JSON" "$NUM_WARPS")"
 fi
 
-log "effective warps: $EFFECTIVE_NUM_WARPS"
+log "effective warps:   $EFFECTIVE_NUM_WARPS"
+
+maybe_stop fnacc-pipeline
 
 # --------------------------------------------------------------------------- #
-# 4-8. Triton -> PTX.
+# 4. TTIR -> TTGIR.
 # --------------------------------------------------------------------------- #
 
 log "[4/12] TTIR -> TTGIR"
-run "$TRITON_OPT" "$TTIR" \
-  "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$EFFECTIVE_NUM_WARPS" \
-  --tritongpu-accelerate-matmul \
-  --canonicalize \
-  --cse \
-  -o "$TTGIR"
+
+if [[ -n "${FNACC_TTIR_TO_TTGIR_PASSES:-}" ]]; then
+  mapfile -t TTIR_TO_TTGIR_PASSES < <(split_pass_pipeline "$FNACC_TTIR_TO_TTGIR_PASSES")
+  run "$TRITON_OPT" "$TTIR" \
+    "${TTIR_TO_TTGIR_PASSES[@]}" \
+    -o "$TTGIR"
+else
+  run "$TRITON_OPT" "$TTIR" \
+    "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$EFFECTIVE_NUM_WARPS" \
+    --tritongpu-accelerate-matmul \
+    --canonicalize \
+    --cse \
+    -o "$TTGIR"
+fi
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$TTGIR" || die "TTGIR was not generated: $TTGIR"
+fi
+
+maybe_stop ttgir
+
+# --------------------------------------------------------------------------- #
+# 5. TTGIR -> LLVM MLIR.
+# --------------------------------------------------------------------------- #
 
 log "[5/12] TTGIR -> LLVM MLIR"
 
@@ -635,15 +798,38 @@ else
     -o "$KERNEL_LLVM_MLIR"
 fi
 
-lower_residual_ttg_warp_id "$KERNEL_LLVM_MLIR"
-validate_no_triton_gpu_ops "$KERNEL_LLVM_MLIR"
-validate_no_unrealized_casts "$KERNEL_LLVM_MLIR"
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$KERNEL_LLVM_MLIR" || die "kernel LLVM MLIR was not generated: $KERNEL_LLVM_MLIR"
+
+  if [[ "${FNACC_PATCH_TTG_WARP_ID:-1}" == "1" ]]; then
+    lower_residual_ttg_warp_id "$KERNEL_LLVM_MLIR"
+  fi
+
+  validate_no_triton_gpu_ops "$KERNEL_LLVM_MLIR"
+  validate_no_unrealized_casts "$KERNEL_LLVM_MLIR"
+fi
+
+maybe_stop llvm-mlir
+
+# --------------------------------------------------------------------------- #
+# 6. LLVM MLIR -> LLVM IR.
+# --------------------------------------------------------------------------- #
 
 log "[6/12] LLVM MLIR -> LLVM IR"
 run "$MLIR_TRANSLATE" \
   --mlir-to-llvmir \
   "$KERNEL_LLVM_MLIR" \
   -o "$KERNEL_LL"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$KERNEL_LL" || die "kernel LLVM IR was not generated: $KERNEL_LL"
+fi
+
+maybe_stop llvm-ir
+
+# --------------------------------------------------------------------------- #
+# 7. LLVM IR -> PTX.
+# --------------------------------------------------------------------------- #
 
 log "[7/12] LLVM IR -> PTX"
 run "$LLC" \
@@ -656,16 +842,35 @@ if [[ "$DRY_RUN" != "1" ]]; then
   test -s "$PTX" || die "PTX was not generated: $PTX"
 fi
 
-log "[8/12] Embed PTX and JSON into object"
-generate_embedded_c "$PTX" "$JSON" "$EMBED_C"
-
-run "$CLANG" \
-  -c "$EMBED_C" \
-  -o "$EMBED_OBJ"
-
+maybe_stop ptx
 
 # --------------------------------------------------------------------------- #
-# 9-10. Host transformed FIR -> object.
+# 8. Embed PTX and JSON into object, unless disabled.
+# --------------------------------------------------------------------------- #
+
+LINK_EMBED_OBJS=()
+
+if [[ "$NO_EMBED" == "1" ]]; then
+  log "[8/12] Embed PTX and JSON into object: skipped by --no-embed"
+else
+  log "[8/12] Embed PTX and JSON into object"
+  generate_embedded_c "$PTX" "$JSON" "$EMBED_C"
+
+  run "$CLANG" \
+    -c "$EMBED_C" \
+    -o "$EMBED_OBJ"
+
+  if [[ "$DRY_RUN" != "1" ]]; then
+    test -s "$EMBED_OBJ" || die "embedded object was not generated: $EMBED_OBJ"
+  fi
+
+  LINK_EMBED_OBJS+=("$EMBED_OBJ")
+fi
+
+maybe_stop embed
+
+# --------------------------------------------------------------------------- #
+# 9. Host transformed FIR -> LLVM IR.
 # --------------------------------------------------------------------------- #
 
 log "[9/12] Host FIR -> LLVM IR"
@@ -673,10 +878,26 @@ run "$TCO" \
   "$HOST_FIR" \
   -o "$HOST_LL"
 
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$HOST_LL" || die "host LLVM IR was not generated: $HOST_LL"
+fi
+
+maybe_stop host-ll
+
+# --------------------------------------------------------------------------- #
+# 10. Host LLVM IR -> object.
+# --------------------------------------------------------------------------- #
+
 log "[10/12] Host LLVM IR -> object"
 run "$CLANG" \
   -c "$HOST_LL" \
   -o "$HOST_OBJ"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$HOST_OBJ" || die "host object was not generated: $HOST_OBJ"
+fi
+
+maybe_stop host-obj
 
 # --------------------------------------------------------------------------- #
 # 11. Compile main/support sources.
@@ -684,11 +905,6 @@ run "$CLANG" \
 
 log "[11/12] Compile Fortran support/main sources"
 
-# Compile support sources first. These may define modules used by the main
-# program, e.g. benchmarks/common/bench_utils.f90 provides bench_utils.mod.
-#
-# If support sources depend on each other, pass them in dependency order via
-# repeated --extra-src arguments.
 for i in "${!EXTRA_SRCS[@]}"; do
   src="${EXTRA_SRCS[$i]}"
   obj="${EXTRA_OBJS[$i]}"
@@ -700,7 +916,6 @@ for i in "${!EXTRA_SRCS[@]}"; do
     -o "$obj"
 done
 
-# Compile main sources after support modules have been generated.
 for i in "${!MAIN_SRCS[@]}"; do
   src="${MAIN_SRCS[$i]}"
   obj="${MAIN_OBJS[$i]}"
@@ -712,6 +927,8 @@ for i in "${!MAIN_SRCS[@]}"; do
     -o "$obj"
 done
 
+maybe_stop objects
+
 # --------------------------------------------------------------------------- #
 # 12. Link.
 # --------------------------------------------------------------------------- #
@@ -722,7 +939,7 @@ run "$FLANG" \
   "${MAIN_OBJS[@]}" \
   "${EXTRA_OBJS[@]}" \
   "$HOST_OBJ" \
-  "$EMBED_OBJ" \
+  "${LINK_EMBED_OBJS[@]}" \
   "-L$LLVM_BUILD/lib" \
   -lFortranFNACCRuntime \
   "-L$CUDA_LIB_DIR" \
@@ -734,6 +951,16 @@ run "$FLANG" \
   "${LIBS[@]}" \
   -o "$EXE"
 
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -x "$EXE" || test -f "$EXE" || die "executable was not generated: $EXE"
+fi
+
+maybe_stop link
+
+# --------------------------------------------------------------------------- #
+# Runner.
+# --------------------------------------------------------------------------- #
+
 RUNNER="$EXE.run"
 
 if [[ "$DRY_RUN" != "1" ]]; then
@@ -741,7 +968,8 @@ if [[ "$DRY_RUN" != "1" ]]; then
   PTX_ABS="$(abspath "$PTX")"
   JSON_ABS="$(abspath "$JSON")"
 
-  cat > "$RUNNER" <<EOF
+  if [[ "$NO_EMBED" == "1" || "$RUNNER_USES_FILES" == "1" ]]; then
+    cat > "$RUNNER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -750,6 +978,18 @@ export FNACC_KERNELS_JSON="\${FNACC_KERNELS_JSON:-$JSON_ABS}"
 
 exec "$EXE_ABS" "\$@"
 EOF
+  else
+    cat > "$RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Kernels are embedded in the executable by fnacc-flang.
+# Optional manual override:
+#   FNACC_PTX=/path/to/kernels.ptx FNACC_KERNELS_JSON=/path/to/kernels.json "$EXE_ABS"
+
+exec "$EXE_ABS" "\$@"
+EOF
+  fi
 
   chmod +x "$RUNNER"
 fi
@@ -760,4 +1000,8 @@ log "runner:     $RUNNER"
 log "ptx:        $PTX"
 log "json:       $JSON"
 log "modules:    $MOD_DIR"
+
+if [[ "$KEEP" == "1" ]]; then
+  log "workdir kept: $WORKDIR"
+fi
 

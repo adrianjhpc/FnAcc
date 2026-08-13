@@ -264,6 +264,13 @@ def collect_targets(
     )
     maybe_add(
         targets_1d,
+        "vector_add_f64",
+        "fnacc",
+        "fnacc_vector_add_f64",
+        build / "benchmarks/fnacc/fnacc-vector-add-f64/fnacc-vector-add-f64",
+    )
+    maybe_add(
+        targets_1d,
         "saxpy",
         "fnacc",
         "fnacc_saxpy",
@@ -271,10 +278,24 @@ def collect_targets(
     )
     maybe_add(
         targets_1d,
+        "saxpy_f64",
+        "fnacc",
+        "fnacc_saxpy_f64",
+        build / "benchmarks/fnacc/fnacc-saxpy-f64/fnacc-saxpy-f64",
+    )
+    maybe_add(
+        targets_1d,
         "axpby",
         "fnacc",
         "fnacc_axpby",
         build / "benchmarks/fnacc/fnacc-axpby/fnacc-axpby",
+    )
+    maybe_add(
+        targets_1d,
+        "axpby_f64",
+        "fnacc",
+        "fnacc_axpby_f64",
+        build / "benchmarks/fnacc/fnacc-axpby-f64/fnacc-axpby-f64",
     )
     maybe_add(
         targets_2d,
@@ -290,6 +311,35 @@ def collect_targets(
         "fnacc_matmul_2d",
         build / "benchmarks/fnacc/fnacc-matmul-2d/fnacc-matmul-2d",
     )
+    maybe_add(
+        targets_2d,
+        "matmul_2d_f64",
+        "fnacc",
+        "fnacc_matmul_2d_f64",
+        build / "benchmarks/fnacc/fnacc-matmul-2d-f64/fnacc-matmul-2d-f64",
+    )
+    maybe_add(
+        targets_1d,
+        "reduction_dot",
+        "fnacc",
+        "fnacc_reduction_dot",
+        build / "benchmarks/fnacc/fnacc-reduction-dot/fnacc-reduction-dot",
+    )
+    maybe_add(
+        targets_1d,
+        "reduction_sum",
+        "fnacc",
+        "fnacc_reduction_sum",
+        build / "benchmarks/fnacc/fnacc-reduction-sum/fnacc-reduction-sum",
+    )
+    maybe_add(
+        targets_1d,
+        "reduction_dot_f64",
+        "fnacc",
+        "fnacc_reduction_dot_f64",
+        build / "benchmarks/fnacc/fnacc-reduction-dot-f64/fnacc-reduction-dot-f64",
+    )
+
 
     # ------------------------------------------------------------------ #
     # CUDA
@@ -305,6 +355,13 @@ def collect_targets(
         )
         maybe_add(
             targets_1d,
+            "vector_add_f64",
+            "cuda",
+            "cuda_vector_add_f64",
+            build / "benchmarks/cuda/cuda-vector-add-f64",
+        )
+        maybe_add(
+            targets_1d,
             "saxpy",
             "cuda",
             "cuda_saxpy",
@@ -312,10 +369,24 @@ def collect_targets(
         )
         maybe_add(
             targets_1d,
+            "saxpy_f64",
+            "cuda",
+            "cuda_saxpy_f64",
+            build / "benchmarks/cuda/cuda-saxpy-f64",
+        )
+        maybe_add(
+            targets_1d,
             "axpby",
             "cuda",
             "cuda_axpby",
             build / "benchmarks/cuda/cuda-axpby",
+        )
+        maybe_add(
+            targets_1d,
+            "axpby_f64",
+            "cuda",
+            "cuda_axpby_f64",
+            build / "benchmarks/cuda/cuda-axpby-f64",
         )
         maybe_add(
             targets_2d,
@@ -326,12 +397,39 @@ def collect_targets(
         )
         maybe_add(
             targets_2d,
+            "matrix_add_2d_f64",
+            "cuda",
+            "cuda_matrix_add_2d_f64",
+            build / "benchmarks/cuda/cuda-matrix-add-2d-f64",
+        )
+        maybe_add(
+            targets_2d,
             "matmul_2d",
             "cuda",
             "cuda_matmul_2d",
             build / "benchmarks/cuda/cuda-matmul-2d",
         )
-
+        maybe_add(
+            targets_1d,
+            "reduction_sum",
+            "cuda",
+            "cuda_reduction_sum",
+            build / "benchmarks/cuda/cuda-reduction-sum",
+        )
+        maybe_add(
+            targets_1d,
+            "reduction_dot",
+            "cuda",
+            "cuda_reduction_dot",
+            build / "benchmarks/cuda/cuda-reduction-dot",
+        )
+        maybe_add(
+            targets_1d,
+            "reduction_dot_f64",
+            "cuda",
+            "cuda_reduction_dot_f64",
+            build / "benchmarks/cuda/cuda-reduction-dot-f64",
+        )
     # ------------------------------------------------------------------ #
     # CUDA cuBLAS
     # ------------------------------------------------------------------ #
@@ -344,6 +442,14 @@ def collect_targets(
                 "cuda_cublas",
                 f"cuda_cublas_matmul_2d_{mode}",
                 build / "benchmarks/cuda/cuda-matmul-2d-cublas",
+                extra_args=[mode],
+            )
+            maybe_add(
+                targets_2d,
+                "matmul_2d_f64",
+                "cuda_cublas",
+                f"cuda_cublas_matmul_2d_f64_{mode}",
+                build / "benchmarks/cuda/cuda-matmul-2d-cublas-f64",
                 extra_args=[mode],
             )
 

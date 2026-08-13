@@ -3,7 +3,7 @@ module bench_utils
   implicit none
 
   private
-  public :: parse_i64_arg, parse_i32_arg, print_result, almost_equal_f32, wall_time
+  public :: parse_i64_arg, parse_i32_arg, print_result, almost_equal_f32, almost_equal_f64, wall_time
 
   integer(c_int), parameter :: fnacc_clock_monotonic = 1_c_int
 
@@ -70,7 +70,7 @@ contains
          trim(name), n, m, reps, avg, bandwidth, errors
   end subroutine print_result
 
-    logical function almost_equal_f32(got, expected) result(ok)
+  logical function almost_equal_f32(got, expected) result(ok)
     real, intent(in) :: got
     real, intent(in) :: expected
 
@@ -89,6 +89,24 @@ contains
 
     ok = diff <= tol
   end function almost_equal_f32
+
+  logical function almost_equal_f64(got, expected) result(ok)
+    real(8), intent(in) :: got
+    real(8), intent(in) :: expected
+
+    real(8) :: diff
+    real(8) :: scale
+    real(8) :: tol
+
+    diff = abs(got - expected)
+    scale = max(1.0, abs(got), abs(expected))
+
+    ! This is intentionally relative because different GPU/CPU backends may use
+    ! fused multiply-add or different reassociation/rounding.
+    tol = max(1.0e-3, 1.0e-4 * scale)
+
+    ok = diff <= tol
+  end function almost_equal_f64
 
   real(c_double) function wall_time()
     type(c_timespec) :: ts

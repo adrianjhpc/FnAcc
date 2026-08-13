@@ -142,13 +142,25 @@ if(FNACC_ENABLE_FNACC_BENCHMARKS)
     vector_add_kernel.f90
     vector_add_main.f90)
 
+  add_fnacc_benchmark(fnacc-vector-add-f64
+    vector_add_f64_kernel.f90
+    vector_add_f64_main.f90)
+
   add_fnacc_benchmark(fnacc-saxpy
     saxpy_kernel.f90
     saxpy_main.f90)
 
+  add_fnacc_benchmark(fnacc-saxpy-f64
+    saxpy_f64_kernel.f90
+    saxpy_f64_main.f90)
+
   add_fnacc_benchmark(fnacc-axpby
     axpby_kernel.f90
     axpby_main.f90)
+
+  add_fnacc_benchmark(fnacc-axpby-f64
+    axpby_f64_kernel.f90
+    axpby_f64_main.f90)
 
   add_fnacc_benchmark(fnacc-matrix-add-2d
     matrix_add_2d_kernel.f90
@@ -157,6 +169,23 @@ if(FNACC_ENABLE_FNACC_BENCHMARKS)
   add_fnacc_benchmark(fnacc-matmul-2d
     matmul_2d_kernel.f90
     matmul_2d_main.f90)
+
+  add_fnacc_benchmark(fnacc-matmul-2d-f64
+    matmul_2d_f64_kernel.f90
+    matmul_2d_f64_main.f90)
+
+  add_fnacc_benchmark(fnacc-reduction-sum
+    reduction_sum_kernel.f90
+    reduction_sum_main.f90)
+
+  add_fnacc_benchmark(fnacc-reduction-dot
+    reduction_dot_kernel.f90
+    reduction_dot_main.f90)
+
+  add_fnacc_benchmark(fnacc-reduction-dot-f64
+    reduction_dot_f64_kernel.f90
+    reduction_dot_f64_main.f90)
+
 endif()
 
 # -----------------------------------------------------------------------------
@@ -353,10 +382,18 @@ endfunction()
 if(FNACC_ENABLE_CUDA_BASELINES)
   if(NVCC)
     add_cuda_benchmark(cuda-vector-add vector_add_cuda.cu)
+    add_cuda_benchmark(cuda-vector-add-f64 vector_add_f64_cuda.cu)
     add_cuda_benchmark(cuda-saxpy saxpy_cuda.cu)
+    add_cuda_benchmark(cuda-saxpy-f64 saxpy_f64_cuda.cu)
     add_cuda_benchmark(cuda-axpby axpby_cuda.cu)
+    add_cuda_benchmark(cuda-axpby-f64 axpby_f64_cuda.cu)
     add_cuda_benchmark(cuda-matrix-add-2d matrix_add_2d_cuda.cu)
+    add_cuda_benchmark(cuda-matrix-add-2d-f64 matrix_add_2d_f64_cuda.cu)
     add_cuda_benchmark(cuda-matmul-2d matmul_2d_cuda.cu)
+    add_cuda_benchmark(cuda-matmul-2d-f64 matmul_2d_f64_cuda.cu)
+    add_cuda_benchmark(cuda-reduction-sum reduction_sum_cuda.cu)
+    add_cuda_benchmark(cuda-reduction-dot reduction_dot_cuda.cu)
+    add_cuda_benchmark(cuda-reduction-dot-f64 reduction_dot_f64_cuda.cu)
   else()
     message(WARNING
       "CUDA baselines requested but nvcc was not found. "
@@ -394,6 +431,7 @@ endfunction()
 if(FNACC_ENABLE_CUDA_BASELINES)
   if(NVCC)
     add_cuda_cublas_benchmark(cuda-matmul-2d-cublas matmul_2d_cublas.cu)
+    add_cuda_cublas_benchmark(cuda-matmul-2d-cublas-f64 matmul_2d_f64_cublas.cu)
   else()
     message(WARNING
       "CUDA baselines requested but nvcc was not found. "

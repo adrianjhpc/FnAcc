@@ -57,30 +57,64 @@ def runner_is_usable(runner: Path) -> bool:
 def find_fnacc_side_files(exe: Path):
     """Find local FNACC PTX/JSON files next to the direct executable.
 
-    fnacc-flang generates files like:
+    Supported layouts:
 
-      fnacc-vector-add.kernels.ptx
-      fnacc-vector-add.kernels.json
+      Legacy single-PTX:
+        foo.kernels.ptx
+        foo.kernels.json
 
-    in the same directory as the executable.
+      Per-kernel PTX:
+        foo.kernels.json
+        foo.kernels.split/
+          fnacc_kernel_0.ptx
+          fnacc_kernel_1.ptx
     """
     directory = exe.parent
     stem = exe.name
 
-    ptx = directory / f"{stem}.kernels.ptx"
     json = directory / f"{stem}.kernels.json"
+    ptx = directory / f"{stem}.kernels.ptx"
+    ptx_dir = directory / f"{stem}.kernels.split"
 
-    if ptx.exists() and json.exists():
-        return ptx, json
+    if json.exists() and ptx_dir.is_dir():
+        return {
+            "json": json,
+            "ptx": None,
+            "ptx_dir": ptx_dir,
+        }
 
-    # Fallback: tolerate alternative naming if needed.
-    ptx_candidates = sorted(directory.glob("*.kernels.ptx"))
+    if json.exists() and ptx.exists():
+        return {
+            "json": json,
+            "ptx": ptx,
+            "ptx_dir": None,
+        }
+
     json_candidates = sorted(directory.glob("*.kernels.json"))
+    ptx_dir_candidates = sorted(
+        p for p in directory.glob("*.kernels.split") if p.is_dir()
+    )
+    ptx_candidates = sorted(directory.glob("*.kernels.ptx"))
 
-    if len(ptx_candidates) == 1 and len(json_candidates) == 1:
-        return ptx_candidates[0], json_candidates[0]
+    if len(json_candidates) == 1 and len(ptx_dir_candidates) == 1:
+        return {
+            "json": json_candidates[0],
+            "ptx": None,
+            "ptx_dir": ptx_dir_candidates[0],
+        }
 
-    return None, None
+    if len(json_candidates) == 1 and len(ptx_candidates) == 1:
+        return {
+            "json": json_candidates[0],
+            "ptx": ptx_candidates[0],
+            "ptx_dir": None,
+        }
+
+    return {
+        "json": None,
+        "ptx": None,
+        "ptx_dir": None,
+    }
 
 
 def choose_exe(path: Path, backend: str):
@@ -410,6 +444,13 @@ def collect_targets(
             build / "benchmarks/cuda/cuda-matmul-2d",
         )
         maybe_add(
+            targets_2d,
+            "matmul_2d_f64",
+            "cuda",
+            "cuda_matmul_2d_f64",
+            build / "benchmarks/cuda/cuda-matmul-2d-f64",
+        )
+        maybe_add(
             targets_1d,
             "reduction_sum",
             "cuda",
@@ -435,6 +476,7 @@ def collect_targets(
     # ------------------------------------------------------------------ #
 
     if include_cublas:
+        # FP32 cuBLAS benchmark: tf32/fp32 modes are meaningful.
         for mode in cublas_modes:
             maybe_add(
                 targets_2d,
@@ -444,15 +486,14 @@ def collect_targets(
                 build / "benchmarks/cuda/cuda-matmul-2d-cublas",
                 extra_args=[mode],
             )
-            maybe_add(
-                targets_2d,
-                "matmul_2d_f64",
-                "cuda_cublas",
-                f"cuda_cublas_matmul_2d_f64_{mode}",
-                build / "benchmarks/cuda/cuda-matmul-2d-cublas-f64",
-                extra_args=[mode],
-            )
-
+         # FP64 cuBLAS benchmark: true DGEMM only. No tf32/fp32 modes.
+        maybe_add(
+            targets_2d,
+            "matmul_2d_f64",
+            "cuda_cublas",
+            "cuda_cublas_matmul_2d_f64",
+            build / "benchmarks/cuda/cuda-matmul-2d-cublas-f64",
+        )
     # ------------------------------------------------------------------ #
     # OpenMP CPU
     # ------------------------------------------------------------------ #
@@ -652,14 +693,20 @@ def build_tasks(
 def env_for_target(base_env, target):
     env = base_env.copy()
 
-    # Avoid container locale warnings from stale/incomplete locale setup.
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
 
     if target["backend"] == "fnacc" and not target.get("uses_runner", False):
-        ptx, json = find_fnacc_side_files(target["direct_exe"])
+        side = find_fnacc_side_files(target["direct_exe"])
 
-        if ptx and json:
+        json = side.get("json")
+        ptx = side.get("ptx")
+        ptx_dir = side.get("ptx_dir")
+
+        if json and ptx_dir:
+            env.setdefault("FNACC_PTX_DIR", str(ptx_dir.resolve()))
+            env.setdefault("FNACC_KERNELS_JSON", str(json.resolve()))
+        elif json and ptx:
             env.setdefault("FNACC_PTX", str(ptx.resolve()))
             env.setdefault("FNACC_KERNELS_JSON", str(json.resolve()))
         else:

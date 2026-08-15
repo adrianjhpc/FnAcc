@@ -13,7 +13,7 @@ contains
     real(8) :: acc
 
     ! f64 matmul currently uses correctness-first scalar-K fallback.
-    !$fnacc parallel tile(8, 8, 32)
+    !$fnacc parallel tile(32, 16, 8)
     do j = 1, size(c, 2)
       do i = 1, size(c, 1)
         acc = 0.0_8

@@ -54,8 +54,17 @@ set(FNACC_NUM_WARPS "1" CACHE STRING
 set(FNACC_THREADS_PER_WARP "32" CACHE STRING
   "Triton/CUDA threads per warp")
 
+set(FNACC_MATMUL_NUM_WARPS "4" CACHE STRING
+  "Number of Triton warps for FNACC matmul benchmarks")
+
+set(FNACC_MATMUL_F64_NUM_WARPS "4" CACHE STRING
+  "Number of Triton warps for FNACC f64 matmul benchmarks")
+
 set(FNACC_NUM_STAGES "3" CACHE STRING
   "Triton pipeline stages")
+
+set(FNACC_F64_MATMUL_STRATEGY "reduce" CACHE STRING
+  "FNACC f64 matmul strategy: reduce, fma, or dot")
 
 set(OPENACC_NVFORTRAN_FLAGS "-O3 -tp=zen3 -acc" CACHE STRING
   "nvfortran flags for OpenACC baselines")
@@ -104,6 +113,16 @@ function(add_fnacc_benchmark name kernel main)
   set(workdir "${CMAKE_CURRENT_BINARY_DIR}/fnacc/${name}")
   set(exe "${workdir}/${name}")
 
+  set(effective_fnacc_num_warps "${FNACC_NUM_WARPS}")
+
+  if("${name}" STREQUAL "fnacc-matmul-2d")
+    set(effective_fnacc_num_warps "${FNACC_MATMUL_NUM_WARPS}")
+  endif()
+
+  if("${name}" STREQUAL "fnacc-matmul-2d-f64")
+    set(effective_fnacc_num_warps "${FNACC_MATMUL_F64_NUM_WARPS}")
+  endif()
+
   add_custom_command(
     OUTPUT "${exe}" "${exe}.run"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${workdir}"
@@ -114,9 +133,10 @@ function(add_fnacc_benchmark name kernel main)
       "LLC=${LLC}"
       "CUDA_LIB_DIR=${CUDA_LIB_DIR}"
       "FNACC_SM=${FNACC_SM}"
-      "FNACC_NUM_WARPS=${FNACC_NUM_WARPS}"
+      "FNACC_NUM_WARPS=${effective_fnacc_num_warps}"
       "FNACC_THREADS_PER_WARP=${FNACC_THREADS_PER_WARP}"
       "FNACC_NUM_STAGES=${FNACC_NUM_STAGES}"
+      "FNACC_F64_MATMUL_STRATEGY=${FNACC_F64_MATMUL_STRATEGY}"
       "${FNACC_WRAPPER}"
         --kernel-src "${CMAKE_CURRENT_LIST_DIR}/fnacc/${kernel}"
         --main-src "${CMAKE_CURRENT_LIST_DIR}/fnacc/${main}"

@@ -76,6 +76,13 @@ int main(int argc, char **argv) {
   long long m_ll = parse_i64(argc, argv, 2, 512);
   int reps = parse_i32(argc, argv, 3, 20);
 
+  if (argc > 4) {
+    std::fprintf(stderr,
+                 "warning: cuda_cublas_matmul_2d_f64 ignores extra mode "
+                 "argument '%s'; FP64 cuBLAS uses true cublasDgemm only\n",
+                 argv[4]);
+  }
+
   // Script-compatible choice:
   //
   //   executable n m reps

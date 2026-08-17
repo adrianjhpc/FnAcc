@@ -14,6 +14,7 @@ CMakeUserPresets.json
 *.kernels.ptx
 *.main.o
 *.run
+*.png
 
 benchmarks/CTestTestfile.cmake
 benchmarks/Makefile

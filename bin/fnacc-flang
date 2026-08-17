@@ -75,6 +75,8 @@ Optional environment:
   FNACC_SM                 default CUDA SM, default 80
   FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
   FLANG                    override flang-new
+  FLANG_INTRINSIC_MODULES_PATH
+                           override Flang's precompiled intrinsic module dir
   FIROPT                   override fir-opt
   TCO                      override tco
   CLANG                    override clang
@@ -716,6 +718,97 @@ resolve_flang() {
   require_exe "$FLANG"
 }
 
+resolve_flang_intrinsic_modules() {
+  local -a compiler_flags=("$@")
+  local -a module_dirs=()
+  local resource_dir=""
+  local target=""
+  local intrinsic_dir=""
+  local flag module_file
+  local i
+
+  # An explicit compiler option has precedence over wrapper discovery.
+  for ((i = 0; i < ${#compiler_flags[@]}; ++i)); do
+    flag="${compiler_flags[i]}"
+    case "$flag" in
+      -fintrinsic-modules-path|-fintrinsic-modules-path=*)
+        return
+        ;;
+      -resource-dir)
+        if ((i + 1 < ${#compiler_flags[@]})); then
+          resource_dir="${compiler_flags[i + 1]}"
+        fi
+        ;;
+      -resource-dir=*)
+        resource_dir="${flag#*=}"
+        ;;
+      --target|-target)
+        if ((i + 1 < ${#compiler_flags[@]})); then
+          target="${compiler_flags[i + 1]}"
+        fi
+        ;;
+      --target=*|-target=*)
+        target="${flag#*=}"
+        ;;
+    esac
+  done
+
+  if [[ -n "${FLANG_INTRINSIC_MODULES_PATH:-}" ]]; then
+    intrinsic_dir="$FLANG_INTRINSIC_MODULES_PATH"
+  elif [[ "$DRY_RUN" == "1" ]]; then
+    FLANG_FRONTEND_FLAGS+=(
+      "-fintrinsic-modules-path=<auto-flang-intrinsic-modules>"
+    )
+    return
+  else
+    if [[ -z "$resource_dir" ]]; then
+      resource_dir="$("$FLANG" --print-resource-dir 2>/dev/null || true)"
+      resource_dir="${resource_dir%%$'\n'*}"
+    fi
+    [[ -n "$resource_dir" && -d "$resource_dir" ]] ||
+      die "could not determine Flang's resource directory; set FLANG_INTRINSIC_MODULES_PATH"
+
+    if [[ -z "$target" ]]; then
+      target="$("$FLANG" --print-target-triple 2>/dev/null || true)"
+      target="${target%%$'\n'*}"
+    fi
+
+    if [[ -n "$target" &&
+      -f "$resource_dir/finclude/flang/$target/iso_fortran_env.mod" ]]; then
+      intrinsic_dir="$resource_dir/finclude/flang/$target"
+    else
+      while IFS= read -r module_file; do
+        module_dirs+=("${module_file%/*}")
+      done < <(
+        find "$resource_dir/finclude/flang" -type f \
+          -name iso_fortran_env.mod -print 2>/dev/null
+      )
+
+      if ((${#module_dirs[@]} == 1)); then
+        intrinsic_dir="${module_dirs[0]}"
+      elif ((${#module_dirs[@]} > 1)) && [[ -n "$target" ]]; then
+        for flag in "${module_dirs[@]}"; do
+          if [[ "$flag" == */"$target" ]]; then
+            [[ -z "$intrinsic_dir" ]] ||
+              die "multiple Flang intrinsic module directories match target '$target'; set FLANG_INTRINSIC_MODULES_PATH"
+            intrinsic_dir="$flag"
+          fi
+        done
+      fi
+    fi
+  fi
+
+  [[ -n "$intrinsic_dir" &&
+    -f "$intrinsic_dir/iso_fortran_env.mod" &&
+    -f "$intrinsic_dir/iso_c_binding.mod" ]] ||
+    die "could not find Flang's iso_fortran_env.mod and iso_c_binding.mod; set FLANG_INTRINSIC_MODULES_PATH"
+
+  FLANG_FRONTEND_FLAGS+=("-fintrinsic-modules-path=$intrinsic_dir")
+  if [[ "$VERBOSE" == "1" ]]; then
+    log "Flang intrinsic modules: $intrinsic_dir"
+  fi
+}
+
 resolve_nm() {
   if [[ -n "${NM:-}" ]]; then
     return
@@ -799,6 +892,7 @@ LINK_SEQUENCE=()
 COMPILE_FLAGS=()
 HOST_CODEGEN_FLAGS=()
 HOST_RELOCATE_FLAGS=()
+FLANG_FRONTEND_FLAGS=()
 FLANG_ARGS=()
 
 OUTPUT=""
@@ -967,7 +1061,7 @@ while [[ $# -gt 0 ]]; do
       add_compile_only "$1" "$2"
       shift 2
       ;;
-    -I|-J|-D|-U|-isystem|-iquote|-idirafter|-include|-module-dir|-Xflang|-Xpreprocessor|-Xassembler|-MF|-MT|-MQ|-dependency-file)
+    -I|-J|-D|-U|-isystem|-iquote|-idirafter|-include|-module-dir|-fintrinsic-modules-path|-Xflang|-Xpreprocessor|-Xassembler|-MF|-MT|-MQ|-dependency-file)
       [[ $# -ge 2 ]] || die "$1 requires an argument"
       FLANG_ARGS+=("$1" "$2")
       add_compile_only "$1" "$2"
@@ -981,7 +1075,7 @@ while [[ $# -gt 0 ]]; do
       add_compile_only "$1"
       shift
       ;;
-    -I?*|-J?*|-D?*|-U?*|-isystem?*|-iquote?*|-idirafter?*|-include?*|-module-dir=*)
+    -I?*|-J?*|-D?*|-U?*|-isystem?*|-iquote?*|-idirafter?*|-include?*|-module-dir=*|-fintrinsic-modules-path=*)
       FLANG_ARGS+=("$1")
       add_compile_only "$1"
       shift
@@ -1234,6 +1328,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if ((FNACC_SOURCE_COUNT > 0)); then
+  resolve_flang_intrinsic_modules "${COMPILE_FLAGS[@]}"
+fi
+
 if (( FNACC_SOURCE_COUNT > 0 )) && [[ "$DRY_RUN" != "1" ]]; then
   write_toolchain_manifest "$WORKDIR/toolchain.txt"
 fi
@@ -1279,7 +1377,9 @@ compile_fnacc_source() {
   maybe_stop modgen
 
   log "  [2/9] Emit FIR"
-  run "$FLANG" -fc1 -emit-fir "$source" "${COMPILE_FLAGS[@]}" -o "$fir"
+  run "$FLANG" -fc1 -emit-fir \
+    "${FLANG_FRONTEND_FLAGS[@]}" \
+    "$source" "${COMPILE_FLAGS[@]}" -o "$fir"
   if [[ "$DRY_RUN" != "1" ]]; then
     test -s "$fir" || die "FIR was not generated: $fir"
   fi

@@ -35,7 +35,8 @@ FNACC options:
   --fnacc-runtime          Force FNACC runtime libraries into the link
   --fnacc-no-runtime       Do not auto-add FNACC runtime libraries
   --fnacc-sm NUM           CUDA SM version, e.g. 80, sm_80, or cc80
-  --fnacc-num-warps N      Triton warps; default FNACC_NUM_WARPS or 1
+  --fnacc-num-warps N      Triton warps; default FNACC_NUM_WARPS or 1.
+                           Multi-warp reduction lowering is automatic.
   --fnacc-threads-per-warp N
                            Threads per warp; CUDA currently requires 32
   --fnacc-num-stages N     Triton pipeline stages; default FNACC_NUM_STAGES or 3
@@ -74,6 +75,11 @@ Optional environment:
   FNACC_NUM_STAGES         number of Triton pipeline stages, defaults to 3
   FNACC_SM                 default CUDA SM, default 80
   FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
+  FNACC_CUDA_DEVICE        CUDA device ordinal; may be changed between calls.
+  FNACC_USE_CURRENT_CONTEXT
+                           Use the caller's current CUDA context instead of a
+                           retained primary context selected by device ordinal.
+  FNACC_REDUCTION_STATS    print reduction workspace counters at process exit
   FLANG                    override flang-new
   FLANG_INTRINSIC_MODULES_PATH
                            override Flang's precompiled intrinsic module dir
@@ -88,8 +94,6 @@ Advanced environment:
   FNACC_TTIR_TO_TTGIR_PASSES
                            Override TTIR -> TTGIR pass pipeline.
                            Parsed with shell-like quoting.
-  FNACC_PATCH_TTG_WARP_ID  Patch residual ttg.warp_id with NVPTX inline asm.
-                           Default: 0 (use only with a validated Triton revision)
   FNACC_ALLOW_EMPTY_KERNELS
                            Allow no recognized kernels in generated JSON.
                            Default: 0
@@ -378,7 +382,7 @@ validate_no_triton_gpu_ops() {
     echo >&2
     echo "This usually means the Triton pass pipeline did not fully lower TTGIR." >&2
     echo "Check that triton-opt provides --convert-nv-gpu-to-llvm, or set FNACC_TTGIR_TO_LLVM_PASSES." >&2
-    echo "As a temporary workaround, compile with --fnacc-num-warps 1." >&2
+    echo "The driver already lowers residual ttg.warp_id operations; this is another unlowered TritonGPU operation." >&2
     rm -f "$ttg_left" "$tt_left"
     exit 1
   fi
@@ -415,7 +419,7 @@ validate_no_unrealized_casts() {
   rm -f "$left"
 }
 
-lower_residual_ttg_warp_id() {
+lower_ttg_warp_id_to_nvvm() {
   local file="$1"
   local tmp
   tmp="$(make_temp_file)"
@@ -453,8 +457,8 @@ with open(inp, "r", encoding="utf-8") as f, open(out, "w", encoding="utf-8") as 
 
 if changed:
     print(
-        f"fnacc-flang: lowered {changed} residual ttg.warp_id op(s) "
-        f"using NVPTX inline asm",
+        f"fnacc-flang: lowered {changed} ttg.warp_id op(s) "
+        f"to the NVPTX warp-id register",
         file=sys.stderr,
     )
 PY
@@ -1244,7 +1248,6 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
   [[ "$NUM_WARPS" =~ ^[0-9]+$ ]] || die "invalid num-warps value '$NUM_WARPS'"
   [[ "$THREADS_PER_WARP" =~ ^[0-9]+$ ]] || die "invalid threads-per-warp value '$THREADS_PER_WARP'"
   [[ "$NUM_STAGES" =~ ^[0-9]+$ ]] || die "invalid num-stages value '$NUM_STAGES'"
-
   if (( ${#SM} > 3 || ${#NUM_WARPS} > 3 || ${#THREADS_PER_WARP} > 3 || ${#NUM_STAGES} > 2 )); then
     die "numeric FNACC launch option is outside the supported range"
   fi
@@ -1475,10 +1478,7 @@ compile_fnacc_source() {
           -o "$kernel_llvm_mlir"
       fi
       test -s "$kernel_llvm_mlir" || die "kernel LLVM MLIR was not generated for $kernel_name"
-      if [[ "${FNACC_PATCH_TTG_WARP_ID:-0}" == "1" ]]; then
-        warn "applying version-sensitive ttg.warp_id workaround"
-        lower_residual_ttg_warp_id "$kernel_llvm_mlir"
-      fi
+      lower_ttg_warp_id_to_nvvm "$kernel_llvm_mlir"
       validate_no_triton_gpu_ops "$kernel_llvm_mlir"
       validate_no_unrealized_casts "$kernel_llvm_mlir"
     done
@@ -1643,4 +1643,3 @@ if [[ "$KEEP" == "1" ]]; then
     log "toolchain: $WORKDIR/toolchain.txt"
   fi
 fi
-

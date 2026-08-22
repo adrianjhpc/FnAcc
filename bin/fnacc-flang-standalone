@@ -1,0 +1,1368 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  fnacc-flang-standalone --kernel-src KERNEL.f90 --main-src MAIN.f90 -o EXE [options]
+
+Required:
+  --kernel-src FILE        Fortran source containing FNACC kernel/module code
+  --main-src FILE          Fortran main/support source. May be repeated.
+  -o, --output EXE         Output executable
+
+Options:
+  --extra-src FILE         Additional non-FNACC Fortran source. May be repeated.
+  --base NAME              Base name for intermediate files
+  --workdir DIR            Parent directory for a unique intermediate directory
+                           (must not contain whitespace; MLIR pass-option limit)
+  --sm NUM                 CUDA SM version, e.g. 80, 90, sm_80, cc80
+
+  --num-warps N            Number of Triton warps, default FNACC_NUM_WARPS or 1
+  --threads-per-warp N     Threads per warp, default FNACC_THREADS_PER_WARP or 32
+  --num-stages N           Triton pipeline stages, default FNACC_NUM_STAGES or 3
+  --f64-matmul-strategy NAME Strategy to use for F64 MatMul
+
+  -I DIR                   Add Fortran include/module search directory
+  -J DIR                   Add Fortran module output/search directory
+  --fflag FLAG             Extra flag passed to flang-new compile steps. May repeat.
+  --ldflag FLAG            Extra linker flag. May repeat.
+  --lib LIB                Extra library, e.g. --lib m means -lm. May repeat.
+
+  --cuda-lib-dir DIR       CUDA driver library directory. If omitted, use the linker's search path.
+
+  --no-embed               Do not embed PTX/JSON. Runner will use external files.
+  --runner-uses-files      Embed PTX/JSON, but generated .run wrapper forces external files.
+                           Useful for debugging stale embedded payloads.
+
+  --stop-after STAGE       Stop after a stage and keep intermediates.
+                           Stages:
+                             modgen
+                             fir
+                             fnacc-pipeline
+                             ttgir
+                             llvm-mlir
+                             llvm-ir
+                             ptx
+                             embed
+                             host-ll
+                             host-obj
+                             objects
+                             link
+
+  --keep                   Keep intermediate files
+  --verbose                Print commands before running them
+  --dry-run                Print commands but do not run them
+  -h, --help               Show this help
+
+Environment:
+  LLVM_BUILD               llvm-project build directory
+  TRITON_OPT               path to triton-opt
+  MLIR_TRANSLATE           path to mlir-translate
+  LLC                      path to llc
+  CUDA_LIB_DIR             Optional CUDA driver library directory
+
+Optional environment:
+  FNACC_NUM_WARPS          number of warps to use, defaults to 1
+  FNACC_THREADS_PER_WARP   threads per warp, defaults to 32
+  FNACC_NUM_STAGES         number of Triton pipeline stages, defaults to 3
+  FNACC_SM                 default CUDA SM, default 80
+  FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
+  FLANG                    override flang-new
+  FIROPT                   override fir-opt
+  TCO                      override tco
+  CLANG                    override clang
+
+Advanced environment:
+  FNACC_TTGIR_TO_LLVM_PASSES
+                           Override TTGIR -> LLVM MLIR pass pipeline.
+                           Parsed with shell-like quoting.
+  FNACC_TTIR_TO_TTGIR_PASSES
+                           Override TTIR -> TTGIR pass pipeline.
+                           Parsed with shell-like quoting.
+  FNACC_PATCH_TTG_WARP_ID  Patch residual ttg.warp_id with NVPTX inline asm.
+                           Default: 0 (use only with a validated Triton revision)
+  FNACC_ALLOW_EMPTY_KERNELS
+                           Allow no recognized kernels in generated JSON.
+                           Default: 0
+EOF
+}
+
+die() {
+  echo "fnacc-flang-standalone: error: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "fnacc-flang-standalone: warning: $*" >&2
+}
+
+log() {
+  echo "[fnacc-flang-standalone] $*" >&2
+}
+
+quote_cmd() {
+  printf '+'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+run() {
+  if [[ "$VERBOSE" == "1" || "$DRY_RUN" == "1" ]]; then
+    quote_cmd "$@"
+  fi
+  if [[ "$DRY_RUN" != "1" ]]; then
+    "$@"
+  fi
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "file not found: $1"
+}
+
+require_exe() {
+  [[ -x "$1" ]] || die "executable not found or not executable: $1"
+}
+
+abspath() {
+  python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
+}
+
+hash_path() {
+  python3 -c 'import hashlib,os,sys; print(hashlib.sha1(os.path.abspath(sys.argv[1]).encode()).hexdigest()[:8])' "$1"
+}
+
+make_temp_file() {
+  mktemp "$WORKDIR/.fnacc-check.XXXXXX"
+}
+
+object_for_src() {
+  local src="$1"
+  local stem hash
+  stem="$(basename "$src")"
+  stem="${stem%.*}"
+  hash="$(hash_path "$src")"
+  echo "$OBJ_DIR/${stem}_${hash}.o"
+}
+
+maybe_stop() {
+  local stage="$1"
+  if [[ "$STOP_AFTER" == "$stage" ]]; then
+    log "stopping after stage: $stage"
+    log "workdir kept: $WORKDIR"
+    exit 0
+  fi
+}
+
+generate_embedded_bundle_c() {
+  local manifest="$1"
+  local json_file="$2"
+  local out_c="$3"
+
+  python3 - "$manifest" "$json_file" "$out_c" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+json_path = Path(sys.argv[2])
+out_path = Path(sys.argv[3])
+
+rows = json.loads(manifest_path.read_text(encoding="utf-8"))
+json_bytes = json_path.read_bytes()
+
+def c_ident(s):
+    return re.sub(r'[^A-Za-z0-9_]', '_', s)
+
+def emit_array(name, data):
+    lines = []
+    lines.append(f"static const unsigned char {name}[] __attribute__((aligned(16))) = {{")
+    for i in range(0, len(data), 12):
+        chunk = data[i:i + 12]
+        lines.append("  " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
+    lines.append("};")
+    return "\n".join(lines)
+
+chunks = []
+ptx_array_names = []
+
+for row in rows:
+    name = c_ident(row["name"])
+    arr = f"__fnacc_embedded_ptx_{row['index']}_{name}"
+    ptx_array_names.append(arr)
+    ptx_bytes = Path(row["ptx"]).read_bytes()
+    chunks.append(emit_array(arr, ptx_bytes))
+
+chunks.append(emit_array("__fnacc_embedded_json", json_bytes))
+
+ptrs = ",\n  ".join(f"(const char *){name}" for name in ptx_array_names)
+sizes = ",\n  ".join(f"sizeof({name})" for name in ptx_array_names)
+
+content = f"""\
+#include <stddef.h>
+
+extern void __fnacc_register_embedded_kernel_bundle(
+    const char * const *ptxData,
+    const size_t *ptxSizes,
+    size_t ptxCount,
+    const char *jsonData,
+    size_t jsonSize);
+
+{chr(10).join(chunks)}
+
+static const char *__fnacc_embedded_ptx_ptrs[] = {{
+  {ptrs}
+}};
+
+static const size_t __fnacc_embedded_ptx_sizes[] = {{
+  {sizes}
+}};
+
+__attribute__((constructor))
+static void __fnacc_register_embedded_payload(void) {{
+  __fnacc_register_embedded_kernel_bundle(
+      __fnacc_embedded_ptx_ptrs,
+      __fnacc_embedded_ptx_sizes,
+      sizeof(__fnacc_embedded_ptx_ptrs) / sizeof(__fnacc_embedded_ptx_ptrs[0]),
+      (const char *)__fnacc_embedded_json,
+      sizeof(__fnacc_embedded_json));
+}}
+"""
+
+out_path.write_text(content, encoding="utf-8")
+PY
+}
+
+validate_ptx_kernel_abi() {
+  local manifest="$1"
+  local json_file="$2"
+
+  python3 - "$manifest" "$json_file" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+metadata = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+kernels = metadata.get("kernels", [])
+
+if len(manifest) != len(kernels):
+    raise SystemExit(
+        f"fnacc-flang-standalone: error: manifest has {len(manifest)} kernels but JSON has {len(kernels)}"
+    )
+
+by_name = {str(k.get("name")): k for k in kernels}
+for row in manifest:
+    name = str(row["name"])
+    kernel = by_name.get(name)
+    if kernel is None:
+        raise SystemExit(f"fnacc-flang-standalone: error: no JSON metadata for PTX kernel {name}")
+
+    text = Path(row["ptx"]).read_text(encoding="utf-8")
+    # Match the entry declaration itself, not the start of its body.  LLVM's
+    # NVPTX backend may place directives such as `.maxntid` between the closing
+    # parameter parenthesis and `{`, so requiring `) {` rejects valid PTX.
+    # Anchoring at the beginning of a line prevents matches in comments while
+    # still accepting the PTX linkage qualifiers used for kernel entries.
+    match = re.search(
+        r"^[ \t]*(?:\.(?:visible|extern|weak)[ \t]+)*\.entry[ \t]+"
+        + re.escape(name)
+        + r"[ \t]*\((.*?)\)",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise SystemExit(f"fnacc-flang-standalone: error: PTX entry {name} was not found in {row['ptx']}")
+
+    actual = len(re.findall(r"\.param\b", match.group(1)))
+    explicit = len(kernel.get("params", []))
+    expected_hidden = int(kernel.get("triton_hidden_ptr_args", 2))
+    actual_hidden = actual - explicit
+    if actual_hidden != expected_hidden:
+        raise SystemExit(
+            "fnacc-flang-standalone: error: Triton/runtime ABI mismatch for "
+            f"{name}: PTX has {actual} parameters ({actual_hidden} hidden), "
+            f"but metadata expects {explicit} explicit + {expected_hidden} hidden. "
+            "Use matching LLVM/Triton sources; do not run this binary."
+        )
+PY
+}
+
+write_toolchain_manifest() {
+  local output="$1"
+  {
+    printf 'generated_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local tool path
+    for tool in FLANG FIROPT TCO CLANG TRITON_OPT MLIR_TRANSLATE LLC; do
+      path="${!tool}"
+      printf '%s=%q\n' "$tool" "$path"
+      printf '%s_VERSION=' "$tool"
+      "$path" --version 2>&1 | head -1 || true
+    done
+    printf 'SM=%s\nNUM_WARPS=%s\nTHREADS_PER_WARP=%s\nNUM_STAGES=%s\n' \
+      "$SM" "$NUM_WARPS" "$THREADS_PER_WARP" "$NUM_STAGES"
+  } > "$output"
+}
+
+validate_json() {
+  local json_file="$1"
+  python3 -m json.tool "$json_file" >/dev/null || die "invalid JSON: $json_file"
+}
+
+validate_kernel_json_nonempty() {
+  local json_file="$1"
+
+  python3 - "$json_file" "${FNACC_ALLOW_EMPTY_KERNELS:-0}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+allow_empty = sys.argv[2] == "1"
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+kernels = data.get("kernels", [])
+if data.get("fnacc_schema_version") != 1:
+    print(f"fnacc-flang-standalone: error: unsupported FNACC JSON schema in {path}", file=sys.stderr)
+    raise SystemExit(1)
+if not kernels and not allow_empty:
+    print(f"fnacc-flang-standalone: error: no kernels were emitted into {path}", file=sys.stderr)
+    print("This usually means no FNACC launch was recognized.", file=sys.stderr)
+    print("Set FNACC_ALLOW_EMPTY_KERNELS=1 to allow this.", file=sys.stderr)
+    raise SystemExit(1)
+
+for kernel in kernels:
+    if not isinstance(kernel.get("params"), list):
+        print("fnacc-flang-standalone: error: kernel JSON has no parameter list", file=sys.stderr)
+        raise SystemExit(1)
+    if int(kernel.get("triton_hidden_ptr_args", -1)) != 2:
+        print(
+            "fnacc-flang-standalone: error: this runtime supports exactly two hidden Triton parameters",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+}
+
+validate_no_triton_gpu_ops() {
+  local file="$1"
+
+  local ttg_left
+  local tt_left
+
+  ttg_left="$(make_temp_file)"
+  tt_left="$(make_temp_file)"
+
+  grep -nE '^[[:space:]]*((%[A-Za-z0-9_.$#-]+[[:space:]]*=[[:space:]]*)?)("?ttg\.)' \
+    "$file" > "$ttg_left" || true
+
+  if [[ -s "$ttg_left" ]]; then
+    echo "fnacc-flang-standalone: error: residual TritonGPU dialect ops remain after LLVM lowering:" >&2
+    head -20 "$ttg_left" >&2
+    echo >&2
+    echo "This usually means the Triton pass pipeline did not fully lower TTGIR." >&2
+    echo "Check that triton-opt provides --convert-nv-gpu-to-llvm, or set FNACC_TTGIR_TO_LLVM_PASSES." >&2
+    echo "As a temporary workaround, compile with --num-warps 1." >&2
+    rm -f "$ttg_left" "$tt_left"
+    exit 1
+  fi
+
+  grep -nE '^[[:space:]]*((%[A-Za-z0-9_.$#-]+[[:space:]]*=[[:space:]]*)?)("?tt\.)' \
+    "$file" > "$tt_left" || true
+
+  if [[ -s "$tt_left" ]]; then
+    echo "fnacc-flang-standalone: error: residual Triton dialect ops remain after LLVM lowering:" >&2
+    head -20 "$tt_left" >&2
+    rm -f "$ttg_left" "$tt_left"
+    exit 1
+  fi
+
+  rm -f "$ttg_left" "$tt_left"
+}
+
+validate_no_unrealized_casts() {
+  local file="$1"
+  local left
+
+  left="$(make_temp_file)"
+
+  grep -nE 'builtin\.unrealized_conversion_cast|"builtin\.unrealized_conversion_cast"' \
+    "$file" > "$left" || true
+
+  if [[ -s "$left" ]]; then
+    echo "fnacc-flang-standalone: error: unrealized conversion casts remain before LLVM translation:" >&2
+    head -20 "$left" >&2
+    rm -f "$left"
+    exit 1
+  fi
+
+  rm -f "$left"
+}
+
+lower_residual_ttg_warp_id() {
+  local file="$1"
+  local tmp
+  tmp="$(make_temp_file)"
+
+  python3 - "$file" "$tmp" <<'PY'
+import re
+import sys
+
+inp = sys.argv[1]
+out = sys.argv[2]
+
+pat = re.compile(
+    r'^(\s*)(%[A-Za-z0-9_.$#-]+)\s*=\s*ttg\.warp_id'
+    r'(?:\s*\{[^}]*\})?'
+    r'(?:\s*:\s*i32)?\s*$'
+)
+
+changed = 0
+
+with open(inp, "r", encoding="utf-8") as f, open(out, "w", encoding="utf-8") as g:
+    for line in f:
+        text = line.rstrip("\n")
+        m = pat.match(text)
+        if not m:
+            g.write(line)
+            continue
+
+        indent, name = m.groups()
+        g.write(
+            f'{indent}{name} = llvm.inline_asm has_side_effects '
+            f'asm_dialect = att "mov.u32 $0, %warpid;", "=r" '
+            f': () -> i32\n'
+        )
+        changed += 1
+
+if changed:
+    print(
+        f"fnacc-flang-standalone: lowered {changed} residual ttg.warp_id op(s) "
+        f"using NVPTX inline asm",
+        file=sys.stderr,
+    )
+PY
+
+  mv "$tmp" "$file"
+}
+
+split_pass_pipeline() {
+  local text="$1"
+  python3 - "$text" <<'PY'
+import shlex
+import sys
+
+for item in shlex.split(sys.argv[1]):
+    print(item)
+PY
+}
+
+split_ttir_per_kernel() {
+  local ttir_file="$1"
+  local json_file="$2"
+  local out_dir="$3"
+  local manifest="$4"
+
+  mkdir -p "$out_dir"
+
+  python3 - "$ttir_file" "$json_file" "$out_dir" "$manifest" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+ttir_path = Path(sys.argv[1])
+json_path = Path(sys.argv[2])
+out_dir = Path(sys.argv[3])
+manifest_path = Path(sys.argv[4])
+
+ttir = ttir_path.read_text(encoding="utf-8")
+
+with json_path.open("r", encoding="utf-8") as f:
+    data = json.load(f)
+
+kernels = data.get("kernels", [])
+
+def find_matching_brace(text, open_pos):
+    depth = 0
+    in_str = False
+    escaped = False
+
+    for i in range(open_pos, len(text)):
+        c = text[i]
+
+        if escaped:
+            escaped = False
+            continue
+
+        if c == "\\" and in_str:
+            escaped = True
+            continue
+
+        if c == '"':
+            in_str = not in_str
+            continue
+
+        if in_str:
+            continue
+
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+
+    raise RuntimeError("unmatched brace")
+
+def extract_tt_func(text, name):
+    marker = f"tt.func @{name}"
+    pos = text.find(marker)
+    if pos < 0:
+        raise RuntimeError(f"could not find TTIR function @{name}")
+
+    line_start = text.rfind("\n", 0, pos) + 1
+
+    sig_end = text.find("\n", pos)
+    if sig_end < 0:
+        raise RuntimeError(f"malformed one-line signature for @{name}")
+
+    sig_line = text[pos:sig_end]
+
+    # Current FNACC emits:
+    #   tt.func @foo(...) attributes {noinline = false} {
+    # The body opener is the last "{" on the signature line.
+    rel_body_open = sig_line.rfind("{")
+    if rel_body_open < 0:
+        raise RuntimeError(f"could not find body opener for @{name}")
+
+    body_open = pos + rel_body_open
+    func_end = find_matching_brace(text, body_open)
+
+    return text[line_start:func_end].rstrip() + "\n"
+
+rows = []
+seen_names = set()
+seen_ids = set()
+
+for idx, k in enumerate(kernels):
+    name = str(k["name"])
+    kernel_id = int(k["id"])
+    num_warps = int(k.get("num_warps", 1))
+    threads_per_warp = int(k.get("threads_per_warp", 32))
+    num_ctas = int(k.get("num_ctas", 1))
+    num_stages = int(k.get("num_stages", 3))
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise RuntimeError(f"unsafe or invalid kernel name: {name!r}")
+    if name in seen_names or kernel_id in seen_ids:
+        raise RuntimeError(f"duplicate kernel name or id: {name!r}, {kernel_id}")
+    if kernel_id < 0 or num_warps <= 0 or threads_per_warp != 32:
+        raise RuntimeError(f"invalid launch metadata for kernel {name}")
+    if num_ctas <= 0 or num_stages <= 0:
+        raise RuntimeError(f"invalid Triton metadata for kernel {name}")
+    seen_names.add(name)
+    seen_ids.add(kernel_id)
+
+    func_text = extract_tt_func(ttir, name)
+
+    module_text = (
+        'module attributes {'
+        f'"ttg.num-warps" = {num_warps} : i32, '
+        f'"ttg.num-ctas" = {num_ctas} : i32, '
+        f'"ttg.num-stages" = {num_stages} : i32, '
+        f'"ttg.threads-per-warp" = {threads_per_warp} : i32'
+        '} {\n'
+        f'{func_text}'
+        '}\n'
+    )
+
+    out_ttir = out_dir / f"{name}.ttir"
+    out_ttir.write_text(module_text, encoding="utf-8")
+
+    rows.append({
+        "index": idx,
+        "id": kernel_id,
+        "name": name,
+        "num_warps": num_warps,
+        "threads_per_warp": threads_per_warp,
+        "ttir": str(out_ttir),
+        "ttgir": str(out_dir / f"{name}.ttgir.mlir"),
+        "llvm_mlir": str(out_dir / f"{name}.llvm.mlir"),
+        "ll": str(out_dir / f"{name}.ll"),
+        "ptx": str(out_dir / f"{name}.ptx"),
+    })
+
+manifest_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+PY
+}
+
+manifest_count() {
+  python3 - "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    print(len(json.load(f)))
+PY
+}
+
+manifest_get() {
+  local manifest="$1"
+  local index="$2"
+  local key="$3"
+
+  python3 - "$manifest" "$index" "$key" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    rows = json.load(f)
+print(rows[int(sys.argv[2])][sys.argv[3]])
+PY
+}
+
+read_effective_num_warps_from_json() {
+  local json_file="$1"
+  local fallback="$2"
+
+  python3 - "$json_file" "$fallback" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+fallback = int(sys.argv[2])
+
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+kernels = data.get("kernels", [])
+if not kernels:
+    print(fallback)
+    raise SystemExit(0)
+
+warps = []
+for k in kernels:
+    try:
+        warps.append(int(k.get("num_warps", fallback)))
+    except Exception:
+        warps.append(fallback)
+
+print(max(warps) if warps else fallback)
+PY
+}
+
+KERNEL_SRC=""
+MAIN_SRCS=()
+EXTRA_SRCS=()
+EXE=""
+BASE=""
+WORKDIR="${FNACC_WORKDIR:-}"
+USER_WORKDIR_SET=0
+
+SM="${FNACC_SM:-80}"
+NUM_WARPS="${FNACC_NUM_WARPS:-1}"
+THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-32}"
+NUM_STAGES="${FNACC_NUM_STAGES:-3}"
+
+F64_MATMUL_STRATEGY="${FNACC_F64_MATMUL_STRATEGY:-reduce}"
+
+KEEP=0
+VERBOSE=0
+DRY_RUN=0
+NO_EMBED=0
+RUNNER_USES_FILES=0
+STOP_AFTER=""
+
+INCLUDE_DIRS=()
+MODULE_DIRS=()
+FFLAGS=()
+LDFLAGS=()
+LIBS=()
+
+CUDA_LIB_DIR="${CUDA_LIB_DIR:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kernel-src)
+      [[ $# -ge 2 ]] || die "--kernel-src requires an argument"
+      [[ -z "$KERNEL_SRC" ]] || die "--kernel-src may be specified only once; compile FNACC sources together"
+      KERNEL_SRC="$2"
+      shift 2
+      ;;
+    --main-src)
+      [[ $# -ge 2 ]] || die "--main-src requires an argument"
+      MAIN_SRCS+=("$2")
+      shift 2
+      ;;
+    --extra-src)
+      [[ $# -ge 2 ]] || die "--extra-src requires an argument"
+      EXTRA_SRCS+=("$2")
+      shift 2
+      ;;
+    -o|--output)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      EXE="$2"
+      shift 2
+      ;;
+    --base)
+      [[ $# -ge 2 ]] || die "--base requires an argument"
+      BASE="$2"
+      shift 2
+      ;;
+    --workdir)
+      [[ $# -ge 2 ]] || die "--workdir requires an argument"
+      WORKDIR="$2"
+      USER_WORKDIR_SET=1
+      shift 2
+      ;;
+    --sm)
+      [[ $# -ge 2 ]] || die "--sm requires an argument"
+      SM="$2"
+      shift 2
+      ;;
+    --num-warps)
+      [[ $# -ge 2 ]] || die "--num-warps requires an argument"
+      NUM_WARPS="$2"
+      shift 2
+      ;;
+    --threads-per-warp)
+      [[ $# -ge 2 ]] || die "--threads-per-warp requires an argument"
+      THREADS_PER_WARP="$2"
+      shift 2
+      ;;
+    --num-stages)
+      [[ $# -ge 2 ]] || die "--num-stages requires an argument"
+      NUM_STAGES="$2"
+      shift 2
+      ;;
+    --f64-matmul-strategy)
+      [[ $# -ge 2 ]] || die "--f64-matmul-strategy requires an argument"
+      F64_MATMUL_STRATEGY="$2"
+      shift 2
+      ;;
+    --cuda-lib-dir)
+      [[ $# -ge 2 ]] || die "--cuda-lib-dir requires an argument"
+      CUDA_LIB_DIR="$2"
+      shift 2
+      ;;
+    -I)
+      [[ $# -ge 2 ]] || die "-I requires an argument"
+      INCLUDE_DIRS+=("$2")
+      shift 2
+      ;;
+    -J)
+      [[ $# -ge 2 ]] || die "-J requires an argument"
+      MODULE_DIRS+=("$2")
+      shift 2
+      ;;
+    --fflag)
+      [[ $# -ge 2 ]] || die "--fflag requires an argument"
+      FFLAGS+=("$2")
+      shift 2
+      ;;
+    --ldflag)
+      [[ $# -ge 2 ]] || die "--ldflag requires an argument"
+      LDFLAGS+=("$2")
+      shift 2
+      ;;
+    --lib)
+      [[ $# -ge 2 ]] || die "--lib requires an argument"
+      LIBS+=("-l$2")
+      shift 2
+      ;;
+    --no-embed)
+      NO_EMBED=1
+      shift
+      ;;
+    --runner-uses-files)
+      RUNNER_USES_FILES=1
+      shift
+      ;;
+    --stop-after)
+      [[ $# -ge 2 ]] || die "--stop-after requires an argument"
+      STOP_AFTER="$2"
+      shift 2
+      ;;
+    --keep)
+      KEEP=1
+      shift
+      ;;
+    --verbose)
+      VERBOSE=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$KERNEL_SRC" ]] || die "missing --kernel-src"
+[[ ${#MAIN_SRCS[@]} -gt 0 ]] || die "missing at least one --main-src"
+[[ -n "$EXE" ]] || die "missing -o/--output"
+
+case "$STOP_AFTER" in
+  ""|modgen|fir|fnacc-pipeline|ttgir|llvm-mlir|llvm-ir|ptx|embed|host-ll|host-obj|objects|link)
+    ;;
+  *)
+    die "invalid --stop-after stage: $STOP_AFTER"
+    ;;
+esac
+
+case "$F64_MATMUL_STRATEGY" in
+  reduce|fma|dot) ;;
+  *) die "invalid --f64-matmul-strategy '$F64_MATMUL_STRATEGY'; expected reduce, fma, or dot" ;;
+esac
+
+require_file "$KERNEL_SRC"
+for src in "${MAIN_SRCS[@]}"; do require_file "$src"; done
+for src in "${EXTRA_SRCS[@]}"; do require_file "$src"; done
+
+SM="${SM#sm_}"
+SM="${SM#cc}"
+
+if ! [[ "$SM" =~ ^[0-9]+$ ]]; then
+  die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, or cc80"
+fi
+
+if ! [[ "$NUM_WARPS" =~ ^[0-9]+$ ]]; then
+  die "invalid num-warps value '$NUM_WARPS'; expected integer"
+fi
+
+if ! [[ "$THREADS_PER_WARP" =~ ^[0-9]+$ ]]; then
+  die "invalid threads-per-warp value '$THREADS_PER_WARP'; expected integer"
+fi
+
+if ! [[ "$NUM_STAGES" =~ ^[0-9]+$ ]]; then
+  die "invalid num-stages value '$NUM_STAGES'; expected integer"
+fi
+
+if (( ${#SM} > 3 || ${#NUM_WARPS} > 3 || ${#THREADS_PER_WARP} > 3 || ${#NUM_STAGES} > 2 )); then
+  die "numeric launch option is outside the supported range"
+fi
+
+SM=$((10#$SM))
+NUM_WARPS=$((10#$NUM_WARPS))
+THREADS_PER_WARP=$((10#$THREADS_PER_WARP))
+NUM_STAGES=$((10#$NUM_STAGES))
+
+if [[ "$NUM_WARPS" == "0" ]]; then
+  die "num-warps must be positive"
+fi
+
+if (( (NUM_WARPS & (NUM_WARPS - 1)) != 0 )); then
+  die "num-warps must be a power of two"
+fi
+
+if [[ "$THREADS_PER_WARP" == "0" ]]; then
+  die "threads-per-warp must be positive"
+fi
+
+if [[ "$THREADS_PER_WARP" != "32" ]]; then
+  die "CUDA lowering currently requires --threads-per-warp 32"
+fi
+
+if [[ "$NUM_STAGES" == "0" ]]; then
+  die "num-stages must be positive"
+fi
+
+if (( NUM_WARPS > 32 )); then
+  die "num-warps must not exceed 32"
+fi
+
+if (( NUM_STAGES > 16 )); then
+  die "num-stages must not exceed 16"
+fi
+
+LLVM_BUILD="${LLVM_BUILD:-}"
+[[ -n "$LLVM_BUILD" ]] || die "LLVM_BUILD is not set"
+
+FLANG="${FLANG:-$LLVM_BUILD/bin/flang-new}"
+FIROPT="${FIROPT:-$LLVM_BUILD/bin/fir-opt}"
+TCO="${TCO:-$LLVM_BUILD/bin/tco}"
+CLANG="${CLANG:-$LLVM_BUILD/bin/clang}"
+
+TRITON_OPT="${TRITON_OPT:-}"
+MLIR_TRANSLATE="${MLIR_TRANSLATE:-}"
+LLC="${LLC:-}"
+
+[[ -n "$TRITON_OPT" ]] || die "TRITON_OPT is not set"
+[[ -n "$MLIR_TRANSLATE" ]] || die "MLIR_TRANSLATE is not set"
+[[ -n "$LLC" ]] || die "LLC is not set"
+
+require_exe "$FLANG"
+require_exe "$FIROPT"
+require_exe "$TCO"
+require_exe "$CLANG"
+require_exe "$TRITON_OPT"
+require_exe "$MLIR_TRANSLATE"
+require_exe "$LLC"
+
+if [[ -n "$CUDA_LIB_DIR" && ! -d "$CUDA_LIB_DIR" ]]; then
+  die "CUDA_LIB_DIR does not exist: $CUDA_LIB_DIR"
+fi
+
+if [[ -z "$BASE" ]]; then
+  BASE="$(basename "$EXE")"
+  BASE="${BASE//[^A-Za-z0-9._-]/_}"
+fi
+
+if ! [[ "$BASE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$BASE" == "." || "$BASE" == ".." ]]; then
+  die "invalid --base '$BASE'; use letters, digits, '.', '_', or '-'"
+fi
+
+if [[ -n "$WORKDIR" && "$WORKDIR" =~ [[:space:]] ]]; then
+  die "--workdir/FNACC_WORKDIR must not contain whitespace because MLIR pass options cannot represent it safely"
+fi
+if [[ -z "$WORKDIR" && "${TMPDIR:-/tmp}" =~ [[:space:]] ]]; then
+  die "TMPDIR must not contain whitespace because MLIR pass options cannot represent it safely"
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  if [[ -z "$WORKDIR" ]]; then
+    WORKDIR="${TMPDIR:-/tmp}/fnacc-flang-standalone.dry-run"
+  else
+    USER_WORKDIR_SET=1
+    WORKDIR="$WORKDIR/fnacc-${BASE}.dry-run"
+  fi
+elif [[ -z "$WORKDIR" ]]; then
+  TEMP_ROOT="${TMPDIR:-/tmp}"
+  if [[ ! -d "$TEMP_ROOT" || ! -w "$TEMP_ROOT" ]]; then
+    TEMP_ROOT="$PWD"
+  fi
+  if [[ "$TEMP_ROOT" =~ [[:space:]] ]]; then
+    die "no writable whitespace-free temporary directory is available"
+  fi
+  WORKDIR="$(mktemp -d "$TEMP_ROOT/fnacc-flang-standalone.XXXXXX")"
+else
+  USER_WORKDIR_SET=1
+  mkdir -p "$WORKDIR"
+  WORKDIR="$(mktemp -d "$WORKDIR/fnacc-${BASE}.XXXXXX")"
+fi
+
+# If external files are required by the runner, the generated PTX/JSON must
+# remain available after the script exits.
+if [[ "$NO_EMBED" == "1" || "$RUNNER_USES_FILES" == "1" || -n "$STOP_AFTER" ]]; then
+  KEEP=1
+fi
+
+cleanup() {
+  if [[ "$KEEP" != "1" && "$DRY_RUN" != "1" && "$USER_WORKDIR_SET" == "0" ]]; then
+    rm -rf "$WORKDIR"
+  fi
+}
+trap cleanup EXIT
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  mkdir -p "$WORKDIR"
+fi
+
+BASE_PATH="$WORKDIR/$BASE"
+MOD_DIR="$WORKDIR/mod"
+OBJ_DIR="$WORKDIR/obj"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  mkdir -p "$MOD_DIR" "$OBJ_DIR"
+fi
+
+INCLUDE_FLAGS=("-I" "$MOD_DIR")
+MODULE_FLAGS=("-J" "$MOD_DIR")
+
+for dir in "${INCLUDE_DIRS[@]}"; do
+  INCLUDE_FLAGS+=("-I" "$dir")
+done
+
+for dir in "${MODULE_DIRS[@]}"; do
+  MODULE_FLAGS+=("-J" "$dir")
+  INCLUDE_FLAGS+=("-I" "$dir")
+done
+
+FIR="$BASE_PATH.fir"
+HOST_FIR="$BASE_PATH.host.fir"
+HOST_LL="$BASE_PATH.host.ll"
+HOST_OBJ="$BASE_PATH.host.o"
+
+TTIR="$BASE_PATH.kernels.ttir"
+JSON="$BASE_PATH.kernels.json"
+KERNEL_SPLIT_DIR="$BASE_PATH.kernels.split"
+KERNEL_MANIFEST="$BASE_PATH.kernels.manifest.json"
+
+EMBED_C="$BASE_PATH.embedded.c"
+EMBED_OBJ="$BASE_PATH.embedded.o"
+
+MAIN_OBJS=()
+for src in "${MAIN_SRCS[@]}"; do
+  MAIN_OBJS+=("$(object_for_src "$src")")
+done
+
+EXTRA_OBJS=()
+for src in "${EXTRA_SRCS[@]}"; do
+  EXTRA_OBJS+=("$(object_for_src "$src")")
+done
+
+log "kernel source:     $KERNEL_SRC"
+log "main sources:      ${MAIN_SRCS[*]}"
+if [[ ${#EXTRA_SRCS[@]} -gt 0 ]]; then
+  log "extra sources:     ${EXTRA_SRCS[*]}"
+fi
+log "output:            $EXE"
+log "workdir:           $WORKDIR"
+log "module dir:        $MOD_DIR"
+log "base:              $BASE"
+log "cuda sm:           sm_$SM"
+log "triton warps:      $NUM_WARPS"
+log "threads/warp:      $THREADS_PER_WARP"
+log "triton stages:     $NUM_STAGES"
+log "embed kernels:     $([[ "$NO_EMBED" == "1" ]] && echo no || echo yes)"
+log "runner uses files: $([[ "$RUNNER_USES_FILES" == "1" || "$NO_EMBED" == "1" ]] && echo yes || echo no)"
+log "keep workdir:      $KEEP"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  write_toolchain_manifest "$BASE_PATH.toolchain.txt"
+fi
+
+# --------------------------------------------------------------------------- #
+# 1. Generate .mod files from the kernel source.
+# --------------------------------------------------------------------------- #
+
+log "[1/10] Generate Fortran module files"
+run "$FLANG" \
+  -fsyntax-only "$KERNEL_SRC" \
+  "${INCLUDE_FLAGS[@]}" \
+  "${MODULE_FLAGS[@]}" \
+  "${FFLAGS[@]}"
+
+maybe_stop modgen
+
+# --------------------------------------------------------------------------- #
+# 2. Emit FIR for the FNACC kernel source.
+# --------------------------------------------------------------------------- #
+
+log "[2/10] Emit FIR for FNACC source"
+run "$FLANG" \
+  -fc1 \
+  -emit-fir \
+  "$KERNEL_SRC" \
+  "${INCLUDE_FLAGS[@]}" \
+  "${MODULE_FLAGS[@]}" \
+  "${FFLAGS[@]}" \
+  -o "$FIR"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$FIR" || die "FIR was not generated: $FIR"
+fi
+
+maybe_stop fir
+
+# --------------------------------------------------------------------------- #
+# 3. FNACC pipeline: TTIR/JSON + host runtime lowering.
+# --------------------------------------------------------------------------- #
+
+log "[3/10] Run FNACC pipeline"
+run "$FIROPT" \
+  "--fnacc-pipeline=ttir-output=$TTIR json-output=$JSON emit-fortran-aliases=true num-warps=$NUM_WARPS threads-per-warp=$THREADS_PER_WARP num-stages=$NUM_STAGES f64-matmul-strategy=$F64_MATMUL_STRATEGY" \
+  "$FIR" \
+  -o "$HOST_FIR"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$TTIR" || die "TTIR was not generated: $TTIR"
+  test -s "$JSON" || die "JSON was not generated: $JSON"
+  test -s "$HOST_FIR" || die "host FIR was not generated: $HOST_FIR"
+  validate_json "$JSON"
+  validate_kernel_json_nonempty "$JSON"
+fi
+
+EFFECTIVE_NUM_WARPS="$NUM_WARPS"
+if [[ "$DRY_RUN" != "1" ]]; then
+  EFFECTIVE_NUM_WARPS="$(read_effective_num_warps_from_json "$JSON" "$NUM_WARPS")"
+fi
+
+log "effective warps:   $EFFECTIVE_NUM_WARPS"
+
+maybe_stop fnacc-pipeline
+
+# --------------------------------------------------------------------------- #
+# 4. TTIR -> PTX.
+# --------------------------------------------------------------------------- #
+
+
+log "[4/10] Split TTIR into one module per FNACC kernel"
+if [[ "$DRY_RUN" == "1" ]]; then
+  quote_cmd python3 "<split-ttir-helper>" "$TTIR" "$JSON" "$KERNEL_SPLIT_DIR" "$KERNEL_MANIFEST"
+  log "[5/10] Per-kernel TTIR -> TTGIR"
+  quote_cmd "$TRITON_OPT" "<kernel.ttir>" "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=<kernel-warps>" -o "<kernel.ttgir.mlir>"
+  maybe_stop ttgir
+
+  log "[5/10] Per-kernel TTGIR -> LLVM MLIR"
+  quote_cmd "$TRITON_OPT" "<kernel.ttgir.mlir>" "<configured-lowering-passes>" -o "<kernel.llvm.mlir>"
+  maybe_stop llvm-mlir
+
+  log "[5/10] Per-kernel LLVM MLIR -> LLVM IR"
+  quote_cmd "$MLIR_TRANSLATE" --mlir-to-llvmir "<kernel.llvm.mlir>" -o "<kernel.ll>"
+  maybe_stop llvm-ir
+
+  log "[5/10] Per-kernel LLVM IR -> PTX"
+  quote_cmd "$LLC" -march=nvptx64 "-mcpu=sm_$SM" "<kernel.ll>" -o "<kernel.ptx>"
+  maybe_stop ptx
+  COUNT=0
+else
+  split_ttir_per_kernel "$TTIR" "$JSON" "$KERNEL_SPLIT_DIR" "$KERNEL_MANIFEST"
+  test -s "$KERNEL_MANIFEST" || die "kernel manifest was not generated: $KERNEL_MANIFEST"
+  COUNT="$(manifest_count "$KERNEL_MANIFEST")"
+
+  log "[5/10] Per-kernel TTIR -> TTGIR"
+  for ((ki = 0; ki < COUNT; ++ki)); do
+    KNAME="$(manifest_get "$KERNEL_MANIFEST" "$ki" name)"
+    KWARPS="$(manifest_get "$KERNEL_MANIFEST" "$ki" num_warps)"
+    KTTIR="$(manifest_get "$KERNEL_MANIFEST" "$ki" ttir)"
+    KTTGIR="$(manifest_get "$KERNEL_MANIFEST" "$ki" ttgir)"
+    log "  kernel $ki: $KNAME num-warps=$KWARPS"
+
+    if [[ -n "${FNACC_TTIR_TO_TTGIR_PASSES:-}" ]]; then
+      mapfile -t TTIR_TO_TTGIR_PASSES < <(split_pass_pipeline "$FNACC_TTIR_TO_TTGIR_PASSES")
+      run "$TRITON_OPT" "$KTTIR" "${TTIR_TO_TTGIR_PASSES[@]}" -o "$KTTGIR"
+    else
+      run "$TRITON_OPT" "$KTTIR" \
+        "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$KWARPS" \
+        --tritongpu-accelerate-matmul --canonicalize --cse -o "$KTTGIR"
+    fi
+    test -s "$KTTGIR" || die "TTGIR was not generated for $KNAME: $KTTGIR"
+  done
+  maybe_stop ttgir
+
+  log "[5/10] Per-kernel TTGIR -> LLVM MLIR"
+  for ((ki = 0; ki < COUNT; ++ki)); do
+    KNAME="$(manifest_get "$KERNEL_MANIFEST" "$ki" name)"
+    KTTGIR="$(manifest_get "$KERNEL_MANIFEST" "$ki" ttgir)"
+    KLLVM_MLIR="$(manifest_get "$KERNEL_MANIFEST" "$ki" llvm_mlir)"
+
+    if [[ -n "${FNACC_TTGIR_TO_LLVM_PASSES:-}" ]]; then
+      mapfile -t TTGIR_TO_LLVM_PASSES < <(split_pass_pipeline "$FNACC_TTGIR_TO_LLVM_PASSES")
+      run "$TRITON_OPT" "$KTTGIR" "${TTGIR_TO_LLVM_PASSES[@]}" -o "$KLLVM_MLIR"
+    else
+      run "$TRITON_OPT" "$KTTGIR" \
+        --tritongpu-coalesce \
+        --tritongpu-remove-layout-conversions \
+        --tritongpu-optimize-thread-locality \
+        --triton-nvidia-gpu-plan-cta \
+        --tritongpu-allocate-warp-groups \
+        --triton-nvidia-mma-lowering \
+        --allocate-shared-memory-nv \
+        --convert-scf-to-cf \
+        --canonicalize \
+        --cse \
+        --convert-triton-gpu-to-llvm \
+        --canonicalize \
+        --cse \
+        --convert-nv-gpu-to-llvm \
+        --convert-index-to-llvm \
+        --convert-arith-to-llvm \
+        --convert-math-to-llvm \
+        --convert-cf-to-llvm \
+        --reconcile-unrealized-casts \
+        --canonicalize \
+        --cse \
+        -o "$KLLVM_MLIR"
+    fi
+    test -s "$KLLVM_MLIR" || die "kernel LLVM MLIR was not generated for $KNAME: $KLLVM_MLIR"
+
+    if [[ "${FNACC_PATCH_TTG_WARP_ID:-0}" == "1" ]]; then
+      warn "applying version-sensitive ttg.warp_id workaround"
+      lower_residual_ttg_warp_id "$KLLVM_MLIR"
+    fi
+    validate_no_triton_gpu_ops "$KLLVM_MLIR"
+    validate_no_unrealized_casts "$KLLVM_MLIR"
+  done
+  maybe_stop llvm-mlir
+
+  log "[5/10] Per-kernel LLVM MLIR -> LLVM IR"
+  for ((ki = 0; ki < COUNT; ++ki)); do
+    KNAME="$(manifest_get "$KERNEL_MANIFEST" "$ki" name)"
+    KLLVM_MLIR="$(manifest_get "$KERNEL_MANIFEST" "$ki" llvm_mlir)"
+    KLL="$(manifest_get "$KERNEL_MANIFEST" "$ki" ll)"
+    run "$MLIR_TRANSLATE" --mlir-to-llvmir "$KLLVM_MLIR" -o "$KLL"
+    test -s "$KLL" || die "kernel LLVM IR was not generated for $KNAME: $KLL"
+  done
+  maybe_stop llvm-ir
+
+  log "[5/10] Per-kernel LLVM IR -> PTX"
+  for ((ki = 0; ki < COUNT; ++ki)); do
+    KNAME="$(manifest_get "$KERNEL_MANIFEST" "$ki" name)"
+    KLL="$(manifest_get "$KERNEL_MANIFEST" "$ki" ll)"
+    KPTX="$(manifest_get "$KERNEL_MANIFEST" "$ki" ptx)"
+    run "$LLC" -march=nvptx64 "-mcpu=sm_$SM" "$KLL" -o "$KPTX"
+    test -s "$KPTX" || die "PTX was not generated for $KNAME: $KPTX"
+  done
+  validate_ptx_kernel_abi "$KERNEL_MANIFEST" "$JSON"
+  maybe_stop ptx
+fi
+
+
+# --------------------------------------------------------------------------- #
+# 8. Embed PTX and JSON into object, unless disabled.
+# --------------------------------------------------------------------------- #
+
+LINK_EMBED_OBJS=()
+
+if [[ "$NO_EMBED" == "1" ]]; then
+  log "[6/10] Embed PTX and JSON into object: skipped by --no-embed"
+else
+  log "[6/10] Embed PTX and JSON into object"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    quote_cmd python3 "<embed-bundle-helper>" "$KERNEL_MANIFEST" "$JSON" "$EMBED_C"
+    run "$CLANG" -c "$EMBED_C" -o "$EMBED_OBJ"
+  else
+    generate_embedded_bundle_c "$KERNEL_MANIFEST" "$JSON" "$EMBED_C"
+    run "$CLANG" -c "$EMBED_C" -o "$EMBED_OBJ"
+    test -s "$EMBED_OBJ" || die "embedded object was not generated: $EMBED_OBJ"
+  fi
+
+  LINK_EMBED_OBJS+=("$EMBED_OBJ")
+fi
+
+maybe_stop embed
+
+# --------------------------------------------------------------------------- #
+# 9. Host transformed FIR -> LLVM IR.
+# --------------------------------------------------------------------------- #
+
+log "[7/10] Host FIR -> LLVM IR"
+run "$TCO" \
+  "$HOST_FIR" \
+  -o "$HOST_LL"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$HOST_LL" || die "host LLVM IR was not generated: $HOST_LL"
+fi
+
+maybe_stop host-ll
+
+# --------------------------------------------------------------------------- #
+# 10. Host LLVM IR -> object.
+# --------------------------------------------------------------------------- #
+
+log "[8/10] Host LLVM IR -> object"
+run "$CLANG" \
+  -c "$HOST_LL" \
+  -o "$HOST_OBJ"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -s "$HOST_OBJ" || die "host object was not generated: $HOST_OBJ"
+fi
+
+maybe_stop host-obj
+
+# --------------------------------------------------------------------------- #
+# 11. Compile main/support sources.
+# --------------------------------------------------------------------------- #
+
+log "[9/10] Compile Fortran support/main sources"
+
+for i in "${!EXTRA_SRCS[@]}"; do
+  src="${EXTRA_SRCS[$i]}"
+  obj="${EXTRA_OBJS[$i]}"
+  run "$FLANG" \
+    -c "$src" \
+    "${INCLUDE_FLAGS[@]}" \
+    "${MODULE_FLAGS[@]}" \
+    "${FFLAGS[@]}" \
+    -o "$obj"
+done
+
+for i in "${!MAIN_SRCS[@]}"; do
+  src="${MAIN_SRCS[$i]}"
+  obj="${MAIN_OBJS[$i]}"
+  run "$FLANG" \
+    -c "$src" \
+    "${INCLUDE_FLAGS[@]}" \
+    "${MODULE_FLAGS[@]}" \
+    "${FFLAGS[@]}" \
+    -o "$obj"
+done
+
+maybe_stop objects
+
+# --------------------------------------------------------------------------- #
+# 12. Link.
+# --------------------------------------------------------------------------- #
+
+log "[10/10] Link executable"
+
+CUDA_LINK_FLAGS=()
+if [[ -n "$CUDA_LIB_DIR" ]]; then
+  CUDA_LINK_FLAGS+=("-L$CUDA_LIB_DIR" "-Wl,-rpath,$CUDA_LIB_DIR")
+fi
+
+run "$FLANG" \
+  "${MAIN_OBJS[@]}" \
+  "${EXTRA_OBJS[@]}" \
+  "$HOST_OBJ" \
+  "${LINK_EMBED_OBJS[@]}" \
+  "-L$LLVM_BUILD/lib" \
+  -lFortranFNACCRuntime \
+  "${CUDA_LINK_FLAGS[@]}" \
+  -lcuda \
+  -lstdc++ \
+  "-Wl,-rpath,$LLVM_BUILD/lib" \
+  "${LDFLAGS[@]}" \
+  "${LIBS[@]}" \
+  -o "$EXE"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  test -x "$EXE" || test -f "$EXE" || die "executable was not generated: $EXE"
+fi
+
+maybe_stop link
+
+# --------------------------------------------------------------------------- #
+# Runner.
+# --------------------------------------------------------------------------- #
+
+RUNNER="$EXE.run"
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  EXE_ABS="$(abspath "$EXE")"
+  JSON_ABS="$(abspath "$JSON")"
+
+  if [[ "$NO_EMBED" == "1" || "$RUNNER_USES_FILES" == "1" ]]; then
+    PTX_DIR_ABS="$(abspath "$KERNEL_SPLIT_DIR")"
+    {
+      printf '#!/usr/bin/env bash\nset -euo pipefail\n\n'
+      printf 'default_ptx_dir=%q\n' "$PTX_DIR_ABS"
+      printf 'default_json=%q\n' "$JSON_ABS"
+      printf 'export FNACC_PTX_DIR="${FNACC_PTX_DIR:-$default_ptx_dir}"\n'
+      printf 'export FNACC_KERNELS_JSON="${FNACC_KERNELS_JSON:-$default_json}"\n\n'
+      printf 'exec %q "$@"\n' "$EXE_ABS"
+    } > "$RUNNER"
+  else
+    {
+      printf '#!/usr/bin/env bash\nset -euo pipefail\n\n'
+      printf '# Kernels are embedded in the executable by fnacc-flang-standalone.\n'
+      printf 'exec %q "$@"\n' "$EXE_ABS"
+    } > "$RUNNER"
+  fi
+
+  chmod +x "$RUNNER"
+fi
+
+log "done"
+log "executable: $EXE"
+log "runner:     $RUNNER"
+log "ptx dir:    $KERNEL_SPLIT_DIR"
+log "json:       $JSON"
+log "modules:    $MOD_DIR"
+if [[ "$DRY_RUN" != "1" ]]; then
+  log "toolchain:  $BASE_PATH.toolchain.txt"
+fi
+
+if [[ "$KEEP" == "1" ]]; then
+  log "workdir kept: $WORKDIR"
+fi
+

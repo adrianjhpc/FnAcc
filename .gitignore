@@ -1,6 +1,8 @@
 build/
 CMakeUserPresets.json
 
+Makefile
+
 *.csv
 *.fir
 *.host.fir
@@ -22,4 +24,5 @@ benchmarks/cmake_install.cmake
 cmake_install.cmake
 CMakeFiles
 CTestTestfile.cmake
+tests/reduction/Testing/
 

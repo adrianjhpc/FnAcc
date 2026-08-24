@@ -35,6 +35,13 @@ FNACC options:
   --fnacc-runtime          Force FNACC runtime libraries into the link
   --fnacc-no-runtime       Do not auto-add FNACC runtime libraries
   --fnacc-sm NUM           CUDA SM version, e.g. 80, sm_80, or cc80
+  --fnacc-backend NAME     Preferred code-generation backend; default auto
+  --fnacc-fallback-backend NAME
+                           Backend used when the preferred backend cannot lower
+                           a kernel; default triton
+  --fnacc-backend-fallback Enable backend fallback (the default)
+  --fnacc-no-backend-fallback
+                           Fail instead of using the fallback backend
   --fnacc-num-warps N      Triton warps; default FNACC_NUM_WARPS or 1.
                            Multi-warp reduction lowering is automatic.
   --fnacc-threads-per-warp N
@@ -79,16 +86,16 @@ Optional environment:
   FNACC_THREADS_PER_WARP   threads per warp, defaults to 32
   FNACC_NUM_STAGES         number of Triton pipeline stages, defaults to 3
   FNACC_SM                 default CUDA SM, default 80
+  FNACC_BACKEND            preferred backend, defaults to auto
+  FNACC_FALLBACK_BACKEND   fallback backend, defaults to triton
+  FNACC_ALLOW_BACKEND_FALLBACK
+                           boolean; defaults to true
   FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
   FNACC_CUDA_DEVICE        CUDA device ordinal; may be changed between calls.
   FNACC_USE_CURRENT_CONTEXT
                            use the caller's current CUDA context instead of a
                            retained primary context selected by device ordinal.
   FNACC_REDUCTION_STATS    print reduction workspace counters at process exit
-  FNACC_BACKEND            specify a target backend
-  FNACC_FALLBACK_BACKEND   specify a default target fallback
-  FNACC_ALLOW_BACKEND_FALLBACK 
-                           control if a fallback backend is allowed
   FLANG                    override flang-new
   FLANG_INTRINSIC_MODULES_PATH
                            override Flang's precompiled intrinsic module dir
@@ -145,6 +152,14 @@ require_exe() {
   [[ -x "$1" ]] || die "executable not found or not executable: $1"
 }
 
+normalize_bool() {
+  case "${1,,}" in
+    1|true|yes|on) printf '%s\n' true ;;
+    0|false|no|off) printf '%s\n' false ;;
+    *) die "invalid boolean '$1'; expected true/false, yes/no, on/off, or 1/0" ;;
+  esac
+}
+
 abspath() {
   python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
@@ -192,6 +207,7 @@ out_path = Path(sys.argv[3])
 
 rows = json.loads(manifest_path.read_text(encoding="utf-8"))
 json_bytes = json_path.read_bytes()
+metadata = json.loads(json_bytes.decode("utf-8"))
 
 def c_ident(s):
     return re.sub(r'[^A-Za-z0-9_]', '_', s)
@@ -206,27 +222,51 @@ def emit_array(name, data):
     return "\n".join(lines)
 
 chunks = []
-ptx_array_names = []
+image_array_names = []
+image_kinds = []
+
+kind_values = {"ptx": 1, "cubin": 2}
+kernels_by_name = {
+    str(kernel.get("name")): kernel for kernel in metadata.get("kernels", [])
+}
 
 for row in rows:
     name = c_ident(row["name"])
-    arr = f"__fnacc_embedded_ptx_{row['index']}_{name}"
-    ptx_array_names.append(arr)
-    ptx_bytes = Path(row["ptx"]).read_bytes()
-    chunks.append(emit_array(arr, ptx_bytes))
+    kernel = kernels_by_name.get(str(row["name"]), {})
+    image_kind = str(
+        kernel.get(
+            "device_image_kind", metadata.get("device_image_kind", "ptx")
+        )
+    )
+    if image_kind not in kind_values:
+        raise SystemExit(
+            f"fnacc-flang: error: cannot embed unsupported image kind {image_kind!r}"
+        )
+    image_path = row.get("image", row.get("ptx"))
+    if not image_path:
+        raise SystemExit(
+            f"fnacc-flang: error: manifest has no device image for {row['name']}"
+        )
+    arr = f"__fnacc_embedded_image_{row['index']}_{name}"
+    image_array_names.append(arr)
+    image_kinds.append(kind_values[image_kind])
+    chunks.append(emit_array(arr, Path(image_path).read_bytes()))
 
 chunks.append(emit_array("__fnacc_embedded_json", json_bytes))
 
-ptrs = ",\n  ".join(f"(const char *){name}" for name in ptx_array_names)
-sizes = ",\n  ".join(f"sizeof({name})" for name in ptx_array_names)
+ptrs = ",\n  ".join(f"(const void *){name}" for name in image_array_names)
+sizes = ",\n  ".join(f"sizeof({name})" for name in image_array_names)
+kinds = ",\n  ".join(str(kind) for kind in image_kinds)
 
 content = f"""\
 #include <stddef.h>
+#include <stdint.h>
 
-extern void __fnacc_register_embedded_kernel_bundle(
-    const char * const *ptxData,
-    const size_t *ptxSizes,
-    size_t ptxCount,
+extern void __fnacc_register_embedded_device_bundle(
+    const void * const *imageData,
+    const size_t *imageSizes,
+    const int32_t *imageKinds,
+    size_t imageCount,
     const char *jsonData,
     size_t jsonSize);
 
@@ -238,20 +278,25 @@ const unsigned char __fnacc_single_embedded_bundle = 1;
 
 {chr(10).join(chunks)}
 
-static const char *__fnacc_embedded_ptx_ptrs[] = {{
+static const void *__fnacc_embedded_image_ptrs[] = {{
   {ptrs}
 }};
 
-static const size_t __fnacc_embedded_ptx_sizes[] = {{
+static const size_t __fnacc_embedded_image_sizes[] = {{
   {sizes}
+}};
+
+static const int32_t __fnacc_embedded_image_kinds[] = {{
+  {kinds}
 }};
 
 __attribute__((constructor))
 static void __fnacc_register_embedded_payload(void) {{
-  __fnacc_register_embedded_kernel_bundle(
-      __fnacc_embedded_ptx_ptrs,
-      __fnacc_embedded_ptx_sizes,
-      sizeof(__fnacc_embedded_ptx_ptrs) / sizeof(__fnacc_embedded_ptx_ptrs[0]),
+  __fnacc_register_embedded_device_bundle(
+      __fnacc_embedded_image_ptrs,
+      __fnacc_embedded_image_sizes,
+      __fnacc_embedded_image_kinds,
+      sizeof(__fnacc_embedded_image_ptrs) / sizeof(__fnacc_embedded_image_ptrs[0]),
       (const char *)__fnacc_embedded_json,
       sizeof(__fnacc_embedded_json));
 }}
@@ -305,7 +350,11 @@ for row in manifest:
 
     actual = len(re.findall(r"\.param\b", match.group(1)))
     explicit = len(kernel.get("params", []))
-    expected_hidden = int(kernel.get("triton_hidden_ptr_args", 2))
+    expected_hidden = int(
+        kernel.get(
+            "private_pointer_args", kernel.get("triton_hidden_ptr_args", 2)
+        )
+    )
     actual_hidden = actual - explicit
     if actual_hidden != expected_hidden:
         raise SystemExit(
@@ -326,10 +375,17 @@ write_toolchain_manifest() {
       path="${!tool}"
       printf '%s=%q\n' "$tool" "$path"
       printf '%s_VERSION=' "$tool"
-      "$path" --version 2>&1 | head -1 || true
+      if [[ -n "$path" && -x "$path" ]]; then
+        "$path" --version 2>&1 | head -1 || true
+      else
+        printf '<not configured>\n'
+      fi
     done
     printf 'SM=%s\nNUM_WARPS=%s\nTHREADS_PER_WARP=%s\nNUM_STAGES=%s\n' \
       "$SM" "$NUM_WARPS" "$THREADS_PER_WARP" "$NUM_STAGES"
+    printf 'BACKEND_REQUESTED=%s\nBACKEND_FALLBACK=%s\nALLOW_BACKEND_FALLBACK=%s\n' \
+      "$BACKEND" "$FALLBACK_BACKEND" \
+      "$ALLOW_BACKEND_FALLBACK"
   } > "$output"
 }
 
@@ -354,6 +410,13 @@ kernels = data.get("kernels", [])
 if data.get("fnacc_schema_version") != 1:
     print(f"fnacc-flang: error: unsupported FNACC JSON schema in {path}", file=sys.stderr)
     raise SystemExit(1)
+contract_version = data.get("backend_contract_version")
+if contract_version is not None and int(contract_version) != 1:
+    print(
+        f"fnacc-flang: error: unsupported backend contract version {contract_version}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 if not kernels and not allow_empty:
     print(f"fnacc-flang: error: no kernels were emitted into {path}", file=sys.stderr)
     print("This usually means no FNACC launch was recognized.", file=sys.stderr)
@@ -364,13 +427,63 @@ for kernel in kernels:
     if not isinstance(kernel.get("params"), list):
         print("fnacc-flang: error: kernel JSON has no parameter list", file=sys.stderr)
         raise SystemExit(1)
-    if int(kernel.get("triton_hidden_ptr_args", -1)) != 2:
+    private_args = int(
+        kernel.get(
+            "private_pointer_args", kernel.get("triton_hidden_ptr_args", -1)
+        )
+    )
+    if private_args != 2:
         print(
-            "fnacc-flang: error: this runtime supports exactly two hidden Triton parameters",
+            "fnacc-flang: error: this runtime supports exactly two private pointer parameters",
             file=sys.stderr,
         )
         raise SystemExit(1)
 PY
+}
+
+read_backend_contract() {
+  local json_file="$1"
+
+  python3 - "$json_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+kernels = data.get("kernels", [])
+
+def first_kernel_value(key, default):
+    if not kernels:
+        return default
+    return kernels[0].get(key, default)
+
+selected = str(data.get("selected_backend", first_kernel_value("backend", "triton")))
+device_ir = str(data.get("device_ir_kind", first_kernel_value("device_ir_kind", "ttir")))
+image_kind = str(
+    data.get("device_image_kind", first_kernel_value("device_image_kind", "ptx"))
+)
+used_fallback = bool(data.get("used_backend_fallback", False))
+
+for kernel in kernels:
+    if str(kernel.get("backend", selected)) != selected:
+        raise SystemExit("fnacc-flang: error: mixed-backend kernel metadata is unsupported")
+    if str(kernel.get("device_ir_kind", device_ir)) != device_ir:
+        raise SystemExit("fnacc-flang: error: mixed device-IR metadata is unsupported")
+    if str(kernel.get("device_image_kind", image_kind)) != image_kind:
+        raise SystemExit("fnacc-flang: error: mixed device-image metadata is unsupported")
+
+print("\t".join((selected, device_ir, image_kind, "true" if used_fallback else "false")))
+PY
+}
+
+require_triton_toolchain() {
+  [[ -n "$TRITON_OPT" ]] || die "TRITON_OPT is required by the selected Triton backend"
+  [[ -n "$MLIR_TRANSLATE" ]] || die "MLIR_TRANSLATE is required by the selected Triton backend"
+  [[ -n "$LLC" ]] || die "LLC is required by the selected Triton backend"
+  require_exe "$TRITON_OPT"
+  require_exe "$MLIR_TRANSLATE"
+  require_exe "$LLC"
 }
 
 validate_no_triton_gpu_ops() {
@@ -613,6 +726,9 @@ for idx, k in enumerate(kernels):
         "index": idx,
         "id": kernel_id,
         "name": name,
+        "backend": str(k.get("backend", data.get("selected_backend", "triton"))),
+        "device_ir_kind": str(k.get("device_ir_kind", data.get("device_ir_kind", "ttir"))),
+        "device_image_kind": str(k.get("device_image_kind", data.get("device_image_kind", "ptx"))),
         "num_warps": num_warps,
         "threads_per_warp": threads_per_warp,
         "ttir": str(out_ttir),
@@ -620,6 +736,7 @@ for idx, k in enumerate(kernels):
         "llvm_mlir": str(out_dir / f"{name}.llvm.mlir"),
         "ll": str(out_dir / f"{name}.ll"),
         "ptx": str(out_dir / f"{name}.ptx"),
+        "image": str(out_dir / f"{name}.ptx"),
     })
 
 manifest_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
@@ -847,7 +964,7 @@ count_embedded_bundles() {
     printf '%s\n' "$marker_count"
     return
   fi
-  register_count="$(grep -c '__fnacc_register_embedded_kernel_bundle' <<<"$symbols" || true)"
+  register_count="$(grep -Ec '__fnacc_register_embedded_(device|kernel)_bundle' <<<"$symbols" || true)"
   printf '%s\n' "$register_count"
 }
 
@@ -922,15 +1039,15 @@ FORCE_RUNTIME=0
 DISABLE_RUNTIME=0
 
 SM="${FNACC_SM:-80}"
+BACKEND="${FNACC_BACKEND:-auto}"
+FALLBACK_BACKEND="${FNACC_FALLBACK_BACKEND:-triton}"
+ALLOW_BACKEND_FALLBACK="${FNACC_ALLOW_BACKEND_FALLBACK:-true}"
 NUM_WARPS="${FNACC_NUM_WARPS:-1}"
 THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-32}"
 NUM_STAGES="${FNACC_NUM_STAGES:-3}"
 F64_MATMUL_STRATEGY="${FNACC_F64_MATMUL_STRATEGY:-reduce}"
 CUDA_LIB_DIR="${CUDA_LIB_DIR:-}"
 WORKDIR_PARENT="${FNACC_WORKDIR:-}"
-BACKEND="${FNACC_BACKEND:-auto}"
-FALLBACK_BACKEND="${FNACC_FALLBACK_BACKEND:-triton}"
-ALLOW_FALLBACK_BACKEND="${FNACC_ALLOW_FALLBACK_BACKEND:-true}"
 
 KEEP=0
 VERBOSE=0
@@ -972,6 +1089,32 @@ while [[ $# -gt 0 ]]; do
       SM="$2"
       shift 2
       ;;
+    --fnacc-backend)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      BACKEND="$2"
+      shift 2
+      ;;
+    --fnacc-backend=*)
+      BACKEND="${1#*=}"
+      shift
+      ;;
+    --fnacc-fallback-backend)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      FALLBACK_BACKEND="$2"
+      shift 2
+      ;;
+    --fnacc-fallback-backend=*)
+      FALLBACK_BACKEND="${1#*=}"
+      shift
+      ;;
+    --fnacc-backend-fallback)
+      ALLOW_BACKEND_FALLBACK=true
+      shift
+      ;;
+    --fnacc-no-backend-fallback)
+      ALLOW_BACKEND_FALLBACK=false
+      shift
+      ;;
     --fnacc-num-warps|--num-warps)
       [[ $# -ge 2 ]] || die "$1 requires an argument"
       NUM_WARPS="$2"
@@ -991,20 +1134,6 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "$1 requires an argument"
       F64_MATMUL_STRATEGY="$2"
       shift 2
-      ;;
-    --fnacc-backend)
-      [[ $# -ge 2 ]] || die "$1 requires an argument"
-      BACKEND="$2"
-      shift 2
-      ;;
-    --fnacc-fallback-backend)
-      [[ $# -ge 2 ]] || die "$1 requires an argument"
-      FALLBACK_BACKEND="$2"
-      shift 2
-      ;;
-    --fnacc-no-backend-fallback)
-      ALLOW_FALLBACK_BACKEND=false
-      shift
       ;;
     --fnacc-cuda-lib-dir|--cuda-lib-dir)
       [[ $# -ge 2 ]] || die "$1 requires an argument"
@@ -1267,6 +1396,12 @@ case "$F64_MATMUL_STRATEGY" in
 esac
 
 if (( FNACC_SOURCE_COUNT > 0 )); then
+  ALLOW_BACKEND_FALLBACK="$(normalize_bool "$ALLOW_BACKEND_FALLBACK")"
+  [[ "$BACKEND" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] ||
+    die "invalid FNACC backend name '$BACKEND'"
+  [[ "$FALLBACK_BACKEND" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] ||
+    die "invalid FNACC fallback backend name '$FALLBACK_BACKEND'"
+
   SM="${SM#sm_}"
   SM="${SM#cc}"
   [[ "$SM" =~ ^[0-9]+$ ]] ||
@@ -1298,16 +1433,9 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
   MLIR_TRANSLATE="${MLIR_TRANSLATE:-}"
   LLC="${LLC:-}"
 
-  [[ -n "$TRITON_OPT" ]] || die "TRITON_OPT is not set"
-  [[ -n "$MLIR_TRANSLATE" ]] || die "MLIR_TRANSLATE is not set"
-  [[ -n "$LLC" ]] || die "LLC is not set"
-
   require_exe "$FIROPT"
   require_exe "$TCO"
   require_exe "$CLANG"
-  require_exe "$TRITON_OPT"
-  require_exe "$MLIR_TRANSLATE"
-  require_exe "$LLC"
 fi
 
 if [[ -n "$CUDA_LIB_DIR" && ! -d "$CUDA_LIB_DIR" ]]; then
@@ -1382,6 +1510,7 @@ compile_fnacc_source() {
   local fir host_fir host_ll host_obj
   local ttir json split_dir manifest embed_c embed_obj
   local effective_num_warps count
+  local selected_backend device_ir_kind device_image_kind used_backend_fallback
   local ki kernel_name kernel_warps kernel_ttir kernel_ttgir kernel_llvm_mlir kernel_ll kernel_ptx
 
   stem="$(sanitize_stem "$source")"
@@ -1399,7 +1528,7 @@ compile_fnacc_source() {
   embed_obj="$base_path.embedded.o"
 
   log "FNACC compile: $source -> $output"
-  log "  target: sm_$SM, warps=$NUM_WARPS, threads/warp=$THREADS_PER_WARP, stages=$NUM_STAGES"
+  log "  target: sm_$SM, backend=$BACKEND, fallback=$FALLBACK_BACKEND, warps=$NUM_WARPS, threads/warp=$THREADS_PER_WARP, stages=$NUM_STAGES"
 
   log "  [1/9] Generate Fortran module files"
   run "$FLANG" -fsyntax-only "$source" "${COMPILE_FLAGS[@]}"
@@ -1424,16 +1553,46 @@ compile_fnacc_source() {
       f64-matmul-strategy=$F64_MATMUL_STRATEGY \
       backend=$BACKEND \
       fallback-backend=$FALLBACK_BACKEND \
-      allow-backend-fallback=$ALLOW_FALLBACK_BACKEND" \
+      allow-backend-fallback=$ALLOW_BACKEND_FALLBACK" \
     "$fir" -o "$host_fir"
   if [[ "$DRY_RUN" != "1" ]]; then
-    test -s "$ttir" || die "TTIR was not generated: $ttir"
+    test -s "$ttir" || die "device IR was not generated: $ttir"
     test -s "$json" || die "JSON was not generated: $json"
     test -s "$host_fir" || die "host FIR was not generated: $host_fir"
     validate_json "$json"
     validate_kernel_json_nonempty "$json"
+    IFS=$'\t' read -r selected_backend device_ir_kind device_image_kind used_backend_fallback \
+      < <(read_backend_contract "$json")
+  else
+    if [[ "$BACKEND" == "auto" || "$BACKEND" == "triton" ]]; then
+      selected_backend=triton
+      device_ir_kind=ttir
+      device_image_kind=ptx
+      used_backend_fallback=false
+    elif [[ "$ALLOW_BACKEND_FALLBACK" == "true" &&
+            "$FALLBACK_BACKEND" == "triton" ]]; then
+      selected_backend=triton
+      device_ir_kind=ttir
+      device_image_kind=ptx
+      used_backend_fallback=true
+    else
+      selected_backend="$BACKEND"
+      device_ir_kind=unknown
+      device_image_kind=unknown
+      used_backend_fallback=false
+    fi
   fi
   maybe_stop fnacc-pipeline
+  log "  selected backend: $selected_backend (device IR=$device_ir_kind, image=$device_image_kind, fallback=$used_backend_fallback)"
+
+  case "$selected_backend:$device_ir_kind:$device_image_kind" in
+    triton:ttir:ptx)
+      require_triton_toolchain
+      ;;
+    *)
+      die "no driver pipeline is registered for backend '$selected_backend' (device IR '$device_ir_kind', image '$device_image_kind')"
+      ;;
+  esac
 
   effective_num_warps="$NUM_WARPS"
   if [[ "$DRY_RUN" != "1" ]]; then

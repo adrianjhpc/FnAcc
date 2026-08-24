@@ -48,6 +48,11 @@ FNACC options:
   --fnacc-verbose          Print commands before running them
   --fnacc-dry-run          Print commands without executing them
   --fnacc-stop-after STAGE Stop one FNACC source after a named internal stage
+  --fnacc-backend NAME     Target a specific backend. At the moment only Triton is supported. You can use "triton" or "auto" here
+  --fnacc-fallback-backend NAME 
+                           Define a fall back backend. If none is specified Triton is the default
+  --fnacc-no-backend-fallback
+                           Turn off a default fallback so compilation fails if one isn't specified or available.
   -h, --help               Show this help
 
 Compatibility aliases:
@@ -77,9 +82,13 @@ Optional environment:
   FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
   FNACC_CUDA_DEVICE        CUDA device ordinal; may be changed between calls.
   FNACC_USE_CURRENT_CONTEXT
-                           Use the caller's current CUDA context instead of a
+                           use the caller's current CUDA context instead of a
                            retained primary context selected by device ordinal.
   FNACC_REDUCTION_STATS    print reduction workspace counters at process exit
+  FNACC_BACKEND            specify a target backend
+  FNACC_FALLBACK_BACKEND   specify a default target fallback
+  FNACC_ALLOW_BACKEND_FALLBACK 
+                           control if a fallback backend is allowed
   FLANG                    override flang-new
   FLANG_INTRINSIC_MODULES_PATH
                            override Flang's precompiled intrinsic module dir
@@ -919,6 +928,9 @@ NUM_STAGES="${FNACC_NUM_STAGES:-3}"
 F64_MATMUL_STRATEGY="${FNACC_F64_MATMUL_STRATEGY:-reduce}"
 CUDA_LIB_DIR="${CUDA_LIB_DIR:-}"
 WORKDIR_PARENT="${FNACC_WORKDIR:-}"
+BACKEND="${FNACC_BACKEND:-auto}"
+FALLBACK_BACKEND="${FNACC_FALLBACK_BACKEND:-triton}"
+ALLOW_FALLBACK_BACKEND="${FNACC_ALLOW_FALLBACK_BACKEND:-true}"
 
 KEEP=0
 VERBOSE=0
@@ -979,6 +991,20 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "$1 requires an argument"
       F64_MATMUL_STRATEGY="$2"
       shift 2
+      ;;
+    --fnacc-backend)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      BACKEND="$2"
+      shift 2
+      ;;
+    --fnacc-fallback-backend)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      FALLBACK_BACKEND="$2"
+      shift 2
+      ;;
+    --fnacc-no-backend-fallback)
+      ALLOW_FALLBACK_BACKEND=false
+      shift
       ;;
     --fnacc-cuda-lib-dir|--cuda-lib-dir)
       [[ $# -ge 2 ]] || die "$1 requires an argument"
@@ -1390,7 +1416,15 @@ compile_fnacc_source() {
 
   log "  [3/9] Run FNACC pipeline"
   run "$FIROPT" \
-    "--fnacc-pipeline=ttir-output=$ttir json-output=$json emit-fortran-aliases=true num-warps=$NUM_WARPS threads-per-warp=$THREADS_PER_WARP num-stages=$NUM_STAGES f64-matmul-strategy=$F64_MATMUL_STRATEGY" \
+    "--fnacc-pipeline=ttir-output=$ttir json-output=$json \
+      emit-fortran-aliases=true \
+      num-warps=$NUM_WARPS \
+      threads-per-warp=$THREADS_PER_WARP \
+      num-stages=$NUM_STAGES \
+      f64-matmul-strategy=$F64_MATMUL_STRATEGY \
+      backend=$BACKEND \
+      fallback-backend=$FALLBACK_BACKEND \
+      allow-backend-fallback=$ALLOW_FALLBACK_BACKEND" \
     "$fir" -o "$host_fir"
   if [[ "$DRY_RUN" != "1" ]]; then
     test -s "$ttir" || die "TTIR was not generated: $ttir"

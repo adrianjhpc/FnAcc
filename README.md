@@ -3,7 +3,7 @@
 FnACC is a programming approach (think OpenACC or OpenMP) to enable porting Fortran programs to GPUs (or other accelerators). It is designed to leverage [Triton](https://triton-lang.org/main/index.html) to port to the accelerator(s), although it is being extended to other backends as well.
 
 
-FnACC is implemented using LLVM's Flang. *Note: The FnACC compiler source code isn't in this repository. It currently lives in the FnACC branch in a fork of LLVM here:(https://github.com/adrianjhpc/llvm-project/tree/FnACC)[https://github.com/adrianjhpc/llvm-project/tree/FnACC]. FnACC currenlty recognises a deliberately constrained set of Fortran loop kernels, builds a backend-neutral kernel plan, emits device code, and replaces the host region with calls to a CUDA Driver API runtime.
+FnACC is implemented using LLVM's Flang. *Note: The FnACC compiler source code isn't in this repository. It currently lives in the FnACC branch in a fork of LLVM here:[https://github.com/adrianjhpc/llvm-project/tree/FnACC](https://github.com/adrianjhpc/llvm-project/tree/FnACC). FnACC currenlty recognises a deliberately constrained set of Fortran loop kernels, builds a backend-neutral kernel plan, emits device code, and replaces the host region with calls to a CUDA Driver API runtime.
 
 The production path currently implemented end to end is:
 

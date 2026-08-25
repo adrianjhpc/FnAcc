@@ -340,6 +340,13 @@ def collect_targets(
     )
     maybe_add(
         targets_2d,
+        "matrix_add_2d_f64",
+        "fnacc",
+        "fnacc_matrix_add_2d_f64",
+        build / "benchmarks/fnacc/fnacc-matrix-add-2d/fnacc-matrix-add-2d-f64",
+    )
+    maybe_add(
+        targets_2d,
         "matmul_2d",
         "fnacc",
         "fnacc_matmul_2d",
@@ -536,10 +543,24 @@ def collect_targets(
         )
         maybe_add(
             targets_2d,
+            "matrix_add_2d_f64",
+            "openmp",
+            "openmp_matrix_add_2d_f64",
+            build / "benchmarks/openmp/openmp-matrix-add-2d-f64",
+        )
+        maybe_add(
+            targets_2d,
             "matmul_2d",
             "openmp",
             "openmp_matmul_2d",
             build / "benchmarks/openmp/openmp-matmul-2d",
+        )
+        maybe_add(
+            targets_2d,
+            "matmul_2d_f64",
+            "openmp",
+            "openmp_matmul_2d_f64",
+            build / "benchmarks/openmp/openmp-matmul-2d-f64",
         )
 
     # ------------------------------------------------------------------ #
@@ -584,12 +605,25 @@ def collect_targets(
         )
         maybe_add(
             targets_2d,
+            "matrix_add_2d_f64",
+            "openmp_gpu",
+            "openmp_gpu_matrix_add_2d_f64",
+            build / "benchmarks/openmp_gpu/openmp-gpu-matrix-add-2d-f64",
+        )
+        maybe_add(
+            targets_2d,
             "matmul_2d",
             "openmp_gpu",
             "openmp_gpu_matmul_2d",
             build / "benchmarks/openmp_gpu/openmp-gpu-matmul-2d",
         )
-
+        maybe_add(
+            targets_2d,
+            "matmul_2d_f64",
+            "openmp_gpu",
+            "openmp_gpu_matmul_2d_f64",
+            build / "benchmarks/openmp_gpu/openmp-gpu-matmul-2d-f64",
+        )
 
     # ------------------------------------------------------------------ #
     # OpenACC
@@ -633,10 +667,24 @@ def collect_targets(
         )
         maybe_add(
             targets_2d,
+            "matrix_add_2d_f64",
+            "openacc",
+            "openacc_matrix_add_2d_f64",
+            build / "benchmarks/openacc/openacc-matrix-add-2d-f64",
+        )
+        maybe_add(
+            targets_2d,
             "matmul_2d",
             "openacc",
             "openacc_matmul_2d",
             build / "benchmarks/openacc/openacc-matmul-2d",
+        )
+        maybe_add(
+            targets_2d,
+            "matmul_2d_f64",
+            "openacc",
+            "openacc_matmul_2d_f64",
+            build / "benchmarks/openacc/openacc-matmul-2d-f64",
         )
 
     return targets_1d, targets_2d

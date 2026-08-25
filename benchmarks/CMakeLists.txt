@@ -336,6 +336,10 @@ if(FNACC_ENABLE_FNACC_BENCHMARKS)
     matrix_add_2d_kernel.f90
     matrix_add_2d_main.f90)
 
+  add_fnacc_benchmark(fnacc-matrix-add-2d-f64
+    matrix_add_2d_f64_kernel.f90
+    matrix_add_2d_f64_main.f90)
+
   add_fnacc_benchmark(fnacc-matmul-2d
     matmul_2d_kernel.f90
     matmul_2d_main.f90)
@@ -401,7 +405,9 @@ if(FNACC_ENABLE_OPENMP_BASELINES)
     add_openmp_benchmark(openmp-daxpy daxpy_openmp.f90)
     add_openmp_benchmark(openmp-axpby axpby_openmp.f90)
     add_openmp_benchmark(openmp-matrix-add-2d matrix_add_2d_openmp.f90)
+    add_openmp_benchmark(openmp-matrix-add-2d-f64 matrix_add_2d_f64_openmp.f90)
     add_openmp_benchmark(openmp-matmul-2d matmul_2d_openmp.f90)
+    add_openmp_benchmark(openmp-matmul-2d-f64 matmul_2d_f64_openmp.f90)
   else()
     message(WARNING "OpenMP baselines requested but no Fortran compiler was found")
   endif()
@@ -454,7 +460,10 @@ if(FNACC_ENABLE_OPENMP_GPU_BASELINES)
     add_openmp_gpu_benchmark(openmp-gpu-daxpy daxpy_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-axpby axpby_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-matrix-add-2d matrix_add_2d_openmp_gpu.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-matrix-add-2d-f64 matrix_add_2d_f64_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-matmul-2d matmul_2d_openmp.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-matmul-2d-f64 matmul_2d_f64_openmp.f90)
+
   else()
     message(WARNING "OpenMP GPU baselines requested but no Fortran compiler was found")
   endif()
@@ -518,7 +527,9 @@ if(FNACC_ENABLE_OPENACC_BASELINES)
     add_openacc_benchmark(openacc-daxpy daxpy_openacc.f90)
     add_openacc_benchmark(openacc-axpby axpby_openacc.f90)
     add_openacc_benchmark(openacc-matrix-add-2d matrix_add_2d_openacc.f90)
+    add_openacc_benchmark(openacc-matrix-add-2d-f64 matrix_add_2d_f64_openacc.f90)
     add_openacc_benchmark(openacc-matmul-2d matmul_2d_openacc.f90)
+    add_openacc_benchmark(openacc-matmul-2d-f64 matmul_2d_f64_openacc.f90)
   else()
     message(WARNING
       "OpenACC baselines requested but nvfortran was not found. "

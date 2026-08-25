@@ -56,7 +56,7 @@ program matrix_add_2d_openacc
   end do
 
   elapsed = t1 - t0
-  bytes_per_rep = 3.0d0 * real(n * m, 8) * 4.0d0
+  bytes_per_rep = 3.0d0 * real(n * m, 8) * real(storage_size(a(1,1))/8, 8)
 
   call print_result("openacc_matrix_add_2d", n, m, reps, elapsed, bytes_per_rep, errors)
 end program

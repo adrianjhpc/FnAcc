@@ -48,7 +48,7 @@ program axpby_fnacc
   call axpby_release(a, b, c)
 
   elapsed = t1 - t0
-  bytes_per_rep = 3.0d0 * real(n, 8) * 4.0d0
+  bytes_per_rep = 3.0d0 * real(n, 8) * real(storage_size(a(1))/8, 8)
 
   call print_result("fnacc_axpby", n, 1_8, reps, elapsed, bytes_per_rep, errors)
 end program

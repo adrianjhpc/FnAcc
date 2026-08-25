@@ -312,10 +312,10 @@ def collect_targets(
     )
     maybe_add(
         targets_1d,
-        "saxpy_f64",
+        "daxpy",
         "fnacc",
-        "fnacc_saxpy_f64",
-        build / "benchmarks/fnacc/fnacc-saxpy-f64/fnacc-saxpy-f64",
+        "fnacc_daxpy",
+        build / "benchmarks/fnacc/fnacc-daxpy/fnacc-daxpy",
     )
     maybe_add(
         targets_1d,
@@ -403,10 +403,10 @@ def collect_targets(
         )
         maybe_add(
             targets_1d,
-            "saxpy_f64",
+            "daxpy",
             "cuda",
-            "cuda_saxpy_f64",
-            build / "benchmarks/cuda/cuda-saxpy-f64",
+            "cuda_daxpy",
+            build / "benchmarks/cuda/cuda-daxpy",
         )
         maybe_add(
             targets_1d,
@@ -515,6 +515,13 @@ def collect_targets(
         )
         maybe_add(
             targets_1d,
+            "daxpy",
+            "openmp",
+            "openmp_daxpy",
+            build / "benchmarks/openmp/openmp-daxpy",
+        )
+        maybe_add(
+            targets_1d,
             "axpby",
             "openmp",
             "openmp_axpby",
@@ -553,6 +560,13 @@ def collect_targets(
             "openmp_gpu",
             "openmp_gpu_saxpy",
             build / "benchmarks/openmp_gpu/openmp-gpu-saxpy",
+        )
+        maybe_add(
+            targets_1d,
+            "daxpy",
+            "openmp_gpu",
+            "openmp_gpu_daxpy",
+            build / "benchmarks/openmp_gpu/openmp-gpu-daxpy",
         )
         maybe_add(
             targets_1d,
@@ -595,6 +609,13 @@ def collect_targets(
             "openacc",
             "openacc_saxpy",
             build / "benchmarks/openacc/openacc-saxpy",
+        )
+        maybe_add(
+            targets_1d,
+            "daxpy",
+            "openacc",
+            "openacc_daxpy",
+            build / "benchmarks/openacc/openacc-daxpy",
         )
         maybe_add(
             targets_1d,
@@ -779,7 +800,7 @@ def main():
         default=[],
         help=(
             "Run only this benchmark. May be repeated. "
-            "Examples: vector_add, saxpy, axpby, matrix_add_2d, matmul_2d."
+            "Examples: vector_add, saxpy, daxpy, axpby, matrix_add_2d, matmul_2d."
         ),
     )
 

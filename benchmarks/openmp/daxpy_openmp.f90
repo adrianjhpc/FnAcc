@@ -1,17 +1,14 @@
-program saxpy_f64_fnacc
+program daxpy_openmp
   use bench_utils
-  use fnacc_saxpy_f64_kernel
+  use omp_lib
   implicit none
 
-  integer(8) :: n
-  integer :: reps
+  integer(8) :: n, i
+  integer :: reps, r, errors
   real(8), allocatable :: x(:), y(:), y0(:)
   real(8) :: alpha
   real(8) :: expected
-  integer(8) :: i
-  integer :: r, errors
-  real(8) :: t0, t1, elapsed
-  real(8) :: bytes_per_rep
+  real(8) :: t0, t1, elapsed, bytes_per_rep
 
   call parse_i64_arg(1, 1048576_8, n)
   call parse_i32_arg(2, 100, reps)
@@ -26,21 +23,26 @@ program saxpy_f64_fnacc
     y0(i) = y(i)
   end do
 
-  call saxpy_f64_prepare(x, y)
-
-  call saxpy_f64_compute(alpha, x, y)
-  call saxpy_f64_fetch(y)
+  !$omp parallel do
+  do i = 1, n
+    y(i) = alpha * x(i) + y(i)
+  end do
 
   y(:) = y0(:)
-  call saxpy_f64_prepare(x, y)
 
   t0 = wall_time()
-  do r = 1, reps
-    call saxpy_f64_compute(alpha, x, y)
-  end do
-  t1 = wall_time()
 
-  call saxpy_f64_fetch(y)
+  !$omp parallel private(r, i)
+  do r = 1, reps
+    !$omp do
+    do i = 1, n
+      y(i) = alpha * x(i) + y(i)
+    end do
+    !$omp end do
+  end do
+  !$omp end parallel
+
+  t1 = wall_time()
 
   errors = 0
   do i = 1, n
@@ -48,11 +50,9 @@ program saxpy_f64_fnacc
     if (.not. almost_equal_f64(y(i), expected)) errors = errors + 1
   end do
 
-  call saxpy_f64_release(x, y)
-
   elapsed = t1 - t0
-  bytes_per_rep = 3.0d0 * real(n, 8) * 4.0d0
+  bytes_per_rep = 3.0d0 * real(n, 8) * real(storage_size(y(1))/8, 8)
 
-  call print_result("fnacc_saxpy", n, 1_8, reps, elapsed, bytes_per_rep, errors)
+  call print_result("openmp_daxpy", n, 1_8, reps, elapsed, bytes_per_rep, errors)
 end program
 

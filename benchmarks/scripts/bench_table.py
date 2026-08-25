@@ -19,6 +19,12 @@ KNOWN_TARGET_ORDER = [
     "openmp_saxpy",
     "openmp_gpu_saxpy",
     "openacc_saxpy",
+ 
+    "fnacc_daxpy",
+    "cuda_daxpy",
+    "openmp_daxpy",
+    "openmp_gpu_daxpy",
+    "openacc_daxpy",
 
     "fnacc_axpby",
     "cuda_axpby",

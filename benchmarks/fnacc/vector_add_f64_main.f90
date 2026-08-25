@@ -47,7 +47,7 @@ program vector_add_f64_fnacc
   call vector_add_f64_release(a, b, c)
 
   elapsed = t1 - t0
-  bytes_per_rep = 3.0d0 * real(n, 8) * 8.0d0
+  bytes_per_rep = 3.0d0 * real(n, 8) * real(storage_size(a(i))/8, 8)
 
   call print_result("fnacc_vector_add_f64", n, 1_8, reps, elapsed, bytes_per_rep, errors)
 end program

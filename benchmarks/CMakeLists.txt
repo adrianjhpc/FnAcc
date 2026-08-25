@@ -320,9 +320,9 @@ if(FNACC_ENABLE_FNACC_BENCHMARKS)
     saxpy_kernel.f90
     saxpy_main.f90)
 
-  add_fnacc_benchmark(fnacc-saxpy-f64
-    saxpy_f64_kernel.f90
-    saxpy_f64_main.f90)
+  add_fnacc_benchmark(fnacc-daxpy
+    daxpy_kernel.f90
+    daxpy_main.f90)
 
   add_fnacc_benchmark(fnacc-axpby
     axpby_kernel.f90
@@ -398,6 +398,7 @@ if(FNACC_ENABLE_OPENMP_BASELINES)
   if(CMAKE_Fortran_COMPILER)
     add_openmp_benchmark(openmp-vector-add vector_add_openmp.f90)
     add_openmp_benchmark(openmp-saxpy saxpy_openmp.f90)
+    add_openmp_benchmark(openmp-daxpy daxpy_openmp.f90)
     add_openmp_benchmark(openmp-axpby axpby_openmp.f90)
     add_openmp_benchmark(openmp-matrix-add-2d matrix_add_2d_openmp.f90)
     add_openmp_benchmark(openmp-matmul-2d matmul_2d_openmp.f90)
@@ -450,6 +451,7 @@ if(FNACC_ENABLE_OPENMP_GPU_BASELINES)
   if(CMAKE_Fortran_COMPILER)
     add_openmp_gpu_benchmark(openmp-gpu-vector-add vector_add_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-saxpy saxpy_openmp_gpu.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-daxpy daxpy_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-axpby axpby_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-matrix-add-2d matrix_add_2d_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-matmul-2d matmul_2d_openmp.f90)
@@ -513,6 +515,7 @@ if(FNACC_ENABLE_OPENACC_BASELINES)
   if(NVFORTRAN)
     add_openacc_benchmark(openacc-vector-add vector_add_openacc.f90)
     add_openacc_benchmark(openacc-saxpy saxpy_openacc.f90)
+    add_openacc_benchmark(openacc-daxpy daxpy_openacc.f90)
     add_openacc_benchmark(openacc-axpby axpby_openacc.f90)
     add_openacc_benchmark(openacc-matrix-add-2d matrix_add_2d_openacc.f90)
     add_openacc_benchmark(openacc-matmul-2d matmul_2d_openacc.f90)
@@ -558,7 +561,7 @@ if(FNACC_ENABLE_CUDA_BASELINES)
     add_cuda_benchmark(cuda-vector-add vector_add_cuda.cu)
     add_cuda_benchmark(cuda-vector-add-f64 vector_add_f64_cuda.cu)
     add_cuda_benchmark(cuda-saxpy saxpy_cuda.cu)
-    add_cuda_benchmark(cuda-saxpy-f64 saxpy_f64_cuda.cu)
+    add_cuda_benchmark(cuda-daxpy daxpy_cuda.cu)
     add_cuda_benchmark(cuda-axpby axpby_cuda.cu)
     add_cuda_benchmark(cuda-axpby-f64 axpby_f64_cuda.cu)
     add_cuda_benchmark(cuda-matrix-add-2d matrix_add_2d_cuda.cu)

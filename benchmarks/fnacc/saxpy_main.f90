@@ -51,7 +51,7 @@ program saxpy_fnacc
   call saxpy_release(x, y)
 
   elapsed = t1 - t0
-  bytes_per_rep = 3.0d0 * real(n, 8) * 4.0d0
+  bytes_per_rep = 3.0d0 * real(n, 8) * real(storage_size(y(1))/8, 8)
 
   call print_result("fnacc_saxpy", n, 1_8, reps, elapsed, bytes_per_rep, errors)
 end program

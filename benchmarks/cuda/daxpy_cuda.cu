@@ -15,7 +15,7 @@ static void check(cudaError_t e, const char *expr, const char *file, int line) {
 
 #define CHECK(expr) check((expr), #expr, __FILE__, __LINE__)
 
-__global__ void saxpy_f64_kernel(double alpha, const double *x, double *y,
+__global__ void daxpy_kernel(double alpha, const double *x, double *y,
                                  long long n) {
   long long i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
   int block = 256;
   int grid = static_cast<int>((n + block - 1) / block);
 
-  saxpy_f64_kernel<<<grid, block>>>(alpha, dx, dy, n);
+  daxpy_kernel<<<grid, block>>>(alpha, dx, dy, n);
   CHECK(cudaGetLastError());
   CHECK(cudaDeviceSynchronize());
 
@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
 
   CHECK(cudaEventRecord(start));
   for (int r = 0; r < reps; ++r)
-    saxpy_f64_kernel<<<grid, block>>>(alpha, dx, dy, n);
+    daxpy_kernel<<<grid, block>>>(alpha, dx, dy, n);
   CHECK(cudaEventRecord(stop));
   CHECK(cudaEventSynchronize(stop));
 
@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
   double bytesPerRep = 3.0 * static_cast<double>(n) * sizeof(double);
   double gbps = bytesPerRep / avgSeconds / 1.0e9;
 
-  std::printf("cuda_saxpy_f64,%lld,1,%d,%.8e,%.8e,%d\n", n, reps, avgSeconds,
+  std::printf("cuda_daxpy,%lld,1,%d,%.8e,%.8e,%d\n", n, reps, avgSeconds,
               gbps, errors);
 
   CHECK(cudaEventDestroy(start));

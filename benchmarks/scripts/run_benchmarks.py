@@ -343,7 +343,7 @@ def collect_targets(
         "matrix_add_2d_f64",
         "fnacc",
         "fnacc_matrix_add_2d_f64",
-        build / "benchmarks/fnacc/fnacc-matrix-add-2d/fnacc-matrix-add-2d-f64",
+        build / "benchmarks/fnacc/fnacc-matrix-add-2d-f64/fnacc-matrix-add-2d-f64",
     )
     maybe_add(
         targets_2d,
@@ -515,6 +515,13 @@ def collect_targets(
         )
         maybe_add(
             targets_1d,
+            "vector_add_f64",
+            "openmp",
+            "openmp_vector_add_f64",
+            build / "benchmarks/openmp/openmp-vector-add-f64",
+        )
+        maybe_add(
+            targets_1d,
             "saxpy",
             "openmp",
             "openmp_saxpy",
@@ -577,6 +584,13 @@ def collect_targets(
         )
         maybe_add(
             targets_1d,
+            "vector_add_f64",
+            "openmp_gpu",
+            "openmp_gpu_vector_add_f64",
+            build / "benchmarks/openmp_gpu/openmp-gpu-vector-add-f64",
+        )
+        maybe_add(
+            targets_1d,
             "saxpy",
             "openmp_gpu",
             "openmp_gpu_saxpy",
@@ -636,6 +650,13 @@ def collect_targets(
             "openacc",
             "openacc_vector_add",
             build / "benchmarks/openacc/openacc-vector-add",
+        )
+        maybe_add(
+            targets_1d,
+            "vector_add_f64",
+            "openacc",
+            "openacc_vector_add_f64",
+            build / "benchmarks/openacc/openacc-vector-add-f64",
         )
         maybe_add(
             targets_1d,

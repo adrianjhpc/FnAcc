@@ -33,7 +33,7 @@ set(LLC "$ENV{LLC}" CACHE FILEPATH
 set(CUDA_LIB_DIR "$ENV{CUDA_LIB_DIR}" CACHE PATH
   "Optional CUDA driver library directory")
 
-set(FNACC_SM "80" CACHE STRING
+set(FNACC_SM "90" CACHE STRING
   "CUDA SM architecture number, e.g. 80, 90")
 
 set(CUDA_ARCH "sm_${FNACC_SM}" CACHE STRING
@@ -401,6 +401,7 @@ endfunction()
 if(FNACC_ENABLE_OPENMP_BASELINES)
   if(CMAKE_Fortran_COMPILER)
     add_openmp_benchmark(openmp-vector-add vector_add_openmp.f90)
+    add_openmp_benchmark(openmp-vector-add-f64 vector_add_f64_openmp.f90)
     add_openmp_benchmark(openmp-saxpy saxpy_openmp.f90)
     add_openmp_benchmark(openmp-daxpy daxpy_openmp.f90)
     add_openmp_benchmark(openmp-axpby axpby_openmp.f90)
@@ -456,6 +457,7 @@ endfunction()
 if(FNACC_ENABLE_OPENMP_GPU_BASELINES)
   if(CMAKE_Fortran_COMPILER)
     add_openmp_gpu_benchmark(openmp-gpu-vector-add vector_add_openmp_gpu.f90)
+    add_openmp_gpu_benchmark(openmp-gpu-vector-add-f64 vector_add_f64_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-saxpy saxpy_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-daxpy daxpy_openmp_gpu.f90)
     add_openmp_gpu_benchmark(openmp-gpu-axpby axpby_openmp_gpu.f90)
@@ -523,6 +525,7 @@ endfunction()
 if(FNACC_ENABLE_OPENACC_BASELINES)
   if(NVFORTRAN)
     add_openacc_benchmark(openacc-vector-add vector_add_openacc.f90)
+    add_openacc_benchmark(openacc-vector-add-f64 vector_add_f64_openacc.f90)
     add_openacc_benchmark(openacc-saxpy saxpy_openacc.f90)
     add_openacc_benchmark(openacc-daxpy daxpy_openacc.f90)
     add_openacc_benchmark(openacc-axpby axpby_openacc.f90)

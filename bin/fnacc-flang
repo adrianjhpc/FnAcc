@@ -1030,7 +1030,7 @@ DISABLE_FNACC=0
 FORCE_RUNTIME=0
 DISABLE_RUNTIME=0
 
-SM="${FNACC_SM:-80}"
+SM="${FNACC_SM:-sm_90a}"
 BACKEND="${FNACC_BACKEND:-auto}"
 FALLBACK_BACKEND="${FNACC_FALLBACK_BACKEND:-triton}"
 ALLOW_BACKEND_FALLBACK="${FNACC_ALLOW_BACKEND_FALLBACK:-true}"
@@ -1392,8 +1392,8 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
 
   SM="${SM#sm_}"
   SM="${SM#cc}"
-  [[ "$SM" =~ ^[0-9]+$ ]] ||
-    die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, or cc80"
+  [[ "$SM" =~ ^[0-9]+a?$ ]] ||
+    die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, cc80, or sm_90a"
   [[ "$NUM_WARPS" =~ ^[0-9]+$ ]] || die "invalid num-warps value '$NUM_WARPS'"
   [[ "$THREADS_PER_WARP" =~ ^[0-9]+$ ]] || die "invalid threads-per-warp value '$THREADS_PER_WARP'"
   [[ "$NUM_STAGES" =~ ^[0-9]+$ ]] || die "invalid num-stages value '$NUM_STAGES'"
@@ -1401,7 +1401,13 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
     die "numeric FNACC launch option is outside the supported range"
   fi
 
-  SM=$((10#$SM))
+  # Separate the number from the 'a' (if it exists)
+  SM_NUM="${SM%a}"
+  SM_SUFFIX="${SM#$SM_NUM}"
+  
+  # Strip leading zeros and define both variables
+  SM_NUM=$((10#$SM_NUM))         # e.g., 90
+  SM="${SM_NUM}${SM_SUFFIX}"     # e.g., 90a
   NUM_WARPS=$((10#$NUM_WARPS))
   THREADS_PER_WARP=$((10#$THREADS_PER_WARP))
   NUM_STAGES=$((10#$NUM_STAGES))
@@ -1518,11 +1524,11 @@ compile_fnacc_source() {
   log "FNACC compile: $source -> $output"
   log "  target: sm_$SM, backend=$BACKEND, fallback=$FALLBACK_BACKEND, warps=$NUM_WARPS, threads/warp=$THREADS_PER_WARP, stages=$NUM_STAGES"
 
-  log "  [1/9] Generate Fortran module files"
+  log "  [1/10] Generate Fortran module files"
   run "$FLANG" -fsyntax-only "$source" "${COMPILE_FLAGS[@]}"
   maybe_stop modgen
 
-  log "  [2/9] Emit FIR"
+  log "  [2/10] Emit FIR"
   run "$FLANG" -fc1 -emit-fir \
     "${FLANG_FRONTEND_FLAGS[@]}" \
     "$source" "${COMPILE_FLAGS[@]}" -o "$fir"
@@ -1531,7 +1537,7 @@ compile_fnacc_source() {
   fi
   maybe_stop fir
 
-  log "  [3/9] Run FNACC pipeline"
+  log "  [3/10] Run FNACC pipeline"
   run env "FNACC_KERNEL_BUNDLE_KEY=$source_hash" "$FIROPT" \
     "--fnacc-pipeline=ttir-output=$ttir json-output=$json \
       emit-fortran-aliases=true \
@@ -1591,7 +1597,7 @@ compile_fnacc_source() {
   if [[ "$DRY_RUN" == "1" ]]; then
     quote_cmd python3 "<split-ttir-helper>" "$ttir" "$json" "$split_dir" "$manifest"
     quote_cmd "$TRITON_OPT" "<kernel.ttir>" \
-      "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=<kernel-warps>" \
+      "--convert-triton-to-tritongpu=target=cuda:$SM_NUM num-warps=<kernel-warps>" \
       -o "<kernel.ttgir.mlir>"
     maybe_stop ttgir
     quote_cmd "$TRITON_OPT" "<kernel.ttgir.mlir>" "<configured-lowering-passes>" \
@@ -1602,12 +1608,12 @@ compile_fnacc_source() {
     quote_cmd "$LLC" -march=nvptx64 "-mcpu=sm_$SM" "<kernel.ll>" -o "<kernel.ptx>"
     maybe_stop ptx
   else
-    log "  [4/9] Split TTIR per kernel"
+    log "  [4/10] Split TTIR per kernel"
     split_ttir_per_kernel "$ttir" "$json" "$split_dir" "$manifest"
     test -s "$manifest" || die "kernel manifest was not generated: $manifest"
     count="$(manifest_count "$manifest")"
 
-    log "  [5/9] Lower kernels to TTGIR"
+    log "  [5/10] Lower kernels to TTGIR"
     for ((ki = 0; ki < count; ++ki)); do
       kernel_name="$(manifest_get "$manifest" "$ki" name)"
       kernel_warps="$(manifest_get "$manifest" "$ki" num_warps)"
@@ -1618,14 +1624,14 @@ compile_fnacc_source() {
         run "$TRITON_OPT" "$kernel_ttir" "${TTIR_TO_TTGIR_PASSES[@]}" -o "$kernel_ttgir"
       else
         run "$TRITON_OPT" "$kernel_ttir" \
-          "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$kernel_warps" \
+          "--convert-triton-to-tritongpu=target=cuda:$SM_NUM num-warps=$kernel_warps" \
           --tritongpu-accelerate-matmul --canonicalize --cse -o "$kernel_ttgir"
       fi
       test -s "$kernel_ttgir" || die "TTGIR was not generated for $kernel_name"
     done
     maybe_stop ttgir
 
-    log "  [6/9] Lower TTGIR to LLVM MLIR"
+    log "  [6/10] Lower TTGIR to LLVM MLIR"
     for ((ki = 0; ki < count; ++ki)); do
       kernel_name="$(manifest_get "$manifest" "$ki" name)"
       kernel_ttgir="$(manifest_get "$manifest" "$ki" ttgir)"
@@ -1665,7 +1671,7 @@ compile_fnacc_source() {
     done
     maybe_stop llvm-mlir
 
-    log "  [7/9] Translate kernels to LLVM IR"
+    log "  [7/10] Translate kernels to LLVM IR"
     for ((ki = 0; ki < count; ++ki)); do
       kernel_name="$(manifest_get "$manifest" "$ki" name)"
       kernel_llvm_mlir="$(manifest_get "$manifest" "$ki" llvm_mlir)"
@@ -1675,7 +1681,7 @@ compile_fnacc_source() {
     done
     maybe_stop llvm-ir
 
-    log "  [7/9] Compile kernels to PTX"
+    log "  [8/10] Compile kernels to PTX"
     for ((ki = 0; ki < count; ++ki)); do
       kernel_name="$(manifest_get "$manifest" "$ki" name)"
       kernel_ll="$(manifest_get "$manifest" "$ki" ll)"
@@ -1687,7 +1693,7 @@ compile_fnacc_source() {
     maybe_stop ptx
   fi
 
-  log "  [8/9] Embed kernel bundle"
+  log "  [9/10] Embed kernel bundle"
   if [[ "$DRY_RUN" == "1" ]]; then
     quote_cmd python3 "<embed-bundle-helper>" "$manifest" "$json" "$embed_c"
     run "$CLANG" "${HOST_CODEGEN_FLAGS[@]}" -c "$embed_c" -o "$embed_obj"
@@ -1698,7 +1704,7 @@ compile_fnacc_source() {
   fi
   maybe_stop embed
 
-  log "  [9/9] Generate host object"
+  log "  [10/10] Generate host object"
   run "$TCO" "$host_fir" -o "$host_ll"
   if [[ "$DRY_RUN" != "1" ]]; then
     test -s "$host_ll" || die "host LLVM IR was not generated: $host_ll"

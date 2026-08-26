@@ -828,8 +828,8 @@ for src in "${EXTRA_SRCS[@]}"; do require_file "$src"; done
 SM="${SM#sm_}"
 SM="${SM#cc}"
 
-if ! [[ "$SM" =~ ^[0-9]+$ ]]; then
-  die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, or cc80"
+if ! [[ "$SM" =~ ^[0-9]+a?$ ]]; then
+    die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, cc80, or sm_90a"
 fi
 
 if ! [[ "$NUM_WARPS" =~ ^[0-9]+$ ]]; then
@@ -848,7 +848,12 @@ if (( ${#SM} > 3 || ${#NUM_WARPS} > 3 || ${#THREADS_PER_WARP} > 3 || ${#NUM_STAG
   die "numeric launch option is outside the supported range"
 fi
 
-SM=$((10#$SM))
+SM_NUM="${SM%a}"
+SM_SUFFIX="${SM#$SM_NUM}"
+
+SM_NUM=$((10#$SM_NUM))         # e.g., 90
+SM="${SM_NUM}${SM_SUFFIX}"     # e.g., 90a
+
 NUM_WARPS=$((10#$NUM_WARPS))
 THREADS_PER_WARP=$((10#$THREADS_PER_WARP))
 NUM_STAGES=$((10#$NUM_STAGES))
@@ -1097,7 +1102,7 @@ log "[4/10] Split TTIR into one module per FNACC kernel"
 if [[ "$DRY_RUN" == "1" ]]; then
   quote_cmd python3 "<split-ttir-helper>" "$TTIR" "$JSON" "$KERNEL_SPLIT_DIR" "$KERNEL_MANIFEST"
   log "[5/10] Per-kernel TTIR -> TTGIR"
-  quote_cmd "$TRITON_OPT" "<kernel.ttir>" "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=<kernel-warps>" -o "<kernel.ttgir.mlir>"
+  quote_cmd "$TRITON_OPT" "<kernel.ttir>" "--convert-triton-to-tritongpu=target=cuda:$SM_NUM num-warps=<kernel-warps>" -o "<kernel.ttgir.mlir>"
   maybe_stop ttgir
 
   log "[5/10] Per-kernel TTGIR -> LLVM MLIR"
@@ -1130,7 +1135,7 @@ else
       run "$TRITON_OPT" "$KTTIR" "${TTIR_TO_TTGIR_PASSES[@]}" -o "$KTTGIR"
     else
       run "$TRITON_OPT" "$KTTIR" \
-        "--convert-triton-to-tritongpu=target=cuda:$SM num-warps=$KWARPS" \
+        "--convert-triton-to-tritongpu=target=cuda:$SM_NUM num-warps=$KWARPS" \
         --tritongpu-accelerate-matmul --canonicalize --cse -o "$KTTGIR"
     fi
     test -s "$KTTGIR" || die "TTGIR was not generated for $KNAME: $KTTGIR"

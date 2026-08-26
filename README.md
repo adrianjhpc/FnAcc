@@ -10,11 +10,11 @@ The production path currently implemented end to end is:
 ```text
 Fortran + !$fnacc
   -> Flang parse tree and FIR
-  -> fnacc.launch and FNACC data operations
+  -> fnacc.launch and FnACC data operations
   -> kernel recognition and backend-neutral planning
   -> Triton TTIR -> TTGIR -> LLVM MLIR -> LLVM IR -> PTX
   -> embedded device-image/JSON bundle
-  -> host object + FNACC CUDA runtime
+  -> host object + FnACC CUDA runtime
 ```
 
 FnACC is a prototype. Its syntax and runtime behaviour are intentionally small and may change. Treat the source, generated JSON schema, and regression tests as the authoritative contract.
@@ -83,13 +83,13 @@ export CUDA_LIB_DIR=/usr/local/cuda/lib64
 ```
 
 Build the FnACC runtime in the LLVM tree with `FLANG_FNACC_RUNTIME=ON`. The
-compatibility spelling `FLANG_FNACC` is also accepted by the current CMake
+compatibility spelling `FLANG_FnACC` is also accepted by the current CMake
 configuration.
 
 Typical rebuild targets are:
 
 ```sh
-cmake --build "$LLVM_BUILD" --target fir-opt flang FortranFNACCRuntime
+cmake --build "$LLVM_BUILD" --target fir-opt flang FortranFnACCRuntime
 ```
 
 ### A complete vector-add example
@@ -352,6 +352,34 @@ Strategy performance and toolchain compatibility are GPU- and Triton-version
 dependent. Validate numerical behaviour and benchmark all three on the target
 system.
 
+### Stencils
+
+FnACC recognizes a rank-two `stencil2d` kernel when a parallel loop nest has
+unit stride, array subscripts are an induction variable plus or minus an
+integer constant, and every externally visible store writes an array element.
+
+The stencil ABI is variadic. It passes one pointer for every distinct array,
+all read-only scalar captures by value, the loop extents and lower bounds, and
+each array's lower bounds and element strides. Arrays with different halo
+widths therefore retain their own leading dimensions. A kernel may write more
+than one output array.
+
+### Current stencil restrictions
+
+- loop steps must be one;
+- subscript offsets must be compile-time integers;
+- rank-two arrays must be contiguous explicit-shape objects or contiguous
+  descriptors;
+- all arrays and scalar captures in one kernel use the same element type;
+- indirect indexing, gathers, and loop-carried dependences are rejected;
+- halo bounds are the program's responsibility. FnACC masks the output domain,
+  while constant-offset input accesses rely on the declared halo.
+
+The runtime detects kernel ID/name collisions when multiple embedded FnACC
+objects are linked. The driver supplies a per-source bundle key so separately
+compiled sources receive stable, disjoint IDs while direct `fir-opt` tests keep
+their traditional sequential IDs.
+
 ## Data types, ranks, and storage
 
 | Feature | Supported today |
@@ -602,7 +630,7 @@ auto-detection.
 The driver automatically adds:
 
 ```text
--L$LLVM_BUILD/lib -lFortranFNACCRuntime -lcuda -lstdc++
+-L$LLVM_BUILD/lib -lFortranFnACCRuntime -lcuda -lstdc++
 ```
 
 and suitable runtime search paths when it detects FnACC code. Use
@@ -737,12 +765,12 @@ The main implementation areas are:
 | Parse tree and syntax | `flang/include/flang/Parser/parse-tree-fnacc.h`, `flang/lib/Parser/fnacc-parsers.cpp` |
 | Unparsing and semantics | `flang/lib/Parser/unparse.cpp`, `flang/lib/Semantics/resolve-names.cpp` |
 | PFT and FIR generation | `flang/include/flang/Lower/PFTBuilder.h`, `flang/lib/Lower/PFTBuilder.cpp`, `flang/lib/Lower/Bridge.cpp` |
-| FNACC dialect | `flang/include/flang/Optimizer/Dialect/FNACC/FNACCOps.td`, `FNACCDialect.td`, `flang/lib/Optimizer/Dialect/FNACC/FNACCDialect.cpp` |
-| Recognition and planning | `FNACCKernelAnalysis.h/.cpp`, `FNACCKernelPlan.h` |
-| Triton backend | `flang/lib/Optimizer/Dialect/FNACC/FNACCLowerToTriton.cpp` |
-| Host runtime lowering | `flang/lib/Optimizer/Dialect/FNACC/FNACCLowerToRuntime.cpp` |
-| Pass pipeline | `FNACCPasses.td`, `FNACCPipelines.cpp` |
-| CUDA runtime | `flang/lib/Runtime/FNACC/fnacc_runtime.cpp` |
+| FnACC dialect | `flang/include/flang/Optimizer/Dialect/FNACC/FNACCOps.td`, `FNACCDialect.td`, `flang/lib/Optimizer/Dialect/FNACC/FNACCDialect.cpp` |
+| Recognition and planning | `FnACCKernelAnalysis.h/.cpp`, `FNACCKernelPlan.h` |
+| Triton backend | `flang/lib/Optimizer/Dialect/FnACC/FNACCLowerToTriton.cpp` |
+| Host runtime lowering | `flang/lib/Optimizer/Dialect/FnACC/FNACCLowerToRuntime.cpp` |
+| Pass pipeline | `FnACCPasses.td`, `FNACCPipelines.cpp` |
+| CUDA runtime | `flang/lib/Runtime/FnACC/fnacc_runtime.cpp` |
 | Traditional driver | `FnAcc/bin/fnacc-flang` |
 
 The FIR dialect includes:
@@ -754,7 +782,7 @@ The FIR dialect includes:
 - `fnacc.release`, `fnacc.release_all`, and `fnacc.wait`.
 
 Handwritten MLIR tests must terminate `fnacc.launch` with
-`fnacc.terminator`; `fir.end` is not the FNACC region terminator.
+`fnacc.terminator`; `fir.end` is not the FnACC region terminator.
 
 ### Pass pipeline
 
@@ -798,12 +826,12 @@ in metadata as `private_pointer_args=2` with the legacy
 
 ## Backend artifact contract
 
-Kernel recognition and scheduling are backend-neutral. `FNACCKernelPlan`
+Kernel recognition and scheduling are backend-neutral. `FnACCKernelPlan`
 contains stable identity, the recognised expression/kernel, tile and subgroup
 schedule, public ABI, pack bindings, and an optional synthetic reduction-stage
 plan.
 
-`FNACCCodegenBackend` provides:
+`FnACCCodegenBackend` provides:
 
 - a backend name;
 - emitted device-IR kind;
@@ -868,10 +896,10 @@ Run a focused test or directory with:
 
 ```sh
 "$LLVM_BUILD/bin/llvm-lit" -sv \
-  /path/to/llvm-project/flang/test/Lower/FNACC/fnacc-pipeline.f90
+  /path/to/llvm-project/flang/test/Lower/FnACC/fnacc-pipeline.f90
 
 "$LLVM_BUILD/bin/llvm-lit" -sv \
-  /path/to/llvm-project/flang/test/FNACC
+  /path/to/llvm-project/flang/test/FnACC
 ```
 
 The suite includes parser/unparser tests, FIR lowering, runtime-call lowering,
@@ -955,8 +983,8 @@ region.
    needed.
 3. Resolve every contained `Name` explicitly in `resolve-names.cpp`.
 4. Add unparse support in `unparse.cpp`.
-5. Add PFT/Bridge lowering to an existing or new FNACC FIR operation.
-6. Define/verify the operation in `FNACCOps.td` and `FNACCDialect.cpp`.
+5. Add PFT/Bridge lowering to an existing or new FnACC FIR operation.
+6. Define/verify the operation in `FnACCOps.td` and `FNACCDialect.cpp`.
 7. Lower it to the runtime or consume it in kernel planning.
 8. Add parser, unparser, FIR, runtime-lowering, and negative tests.
 
@@ -964,7 +992,7 @@ region.
 
 1. Extend `ElementwiseExprKind`.
 2. Recognise the exact FIR operation or Flang lowering idiom in
-   `FNACCKernelAnalysis.cpp`.
+   `FnACCKernelAnalysis.cpp`.
 3. Enforce element/predicate result kinds and type restrictions.
 4. Mark all recognised operations as consumed.
 5. Emit the expression in each applicable backend.
@@ -992,7 +1020,7 @@ kernel whose indexing, mutation, or ABI has not been proven safe.
 
 ### Add a device backend
 
-1. Implement `FNACCCodegenBackend` against `FNACCKernelPlan`.
+1. Implement `FnACCCodegenBackend` against `FNACCKernelPlan`.
 2. Give unsupported plans precise `querySupport` diagnostics.
 3. Register backend selection and fallback behaviour.
 4. Emit schema-v1/backend-contract-v1 metadata.
@@ -1002,7 +1030,7 @@ kernel whose indexing, mutation, or ABI has not been proven safe.
 8. Test preferred, automatic, fallback, disabled-fallback, unsupported, and
    mixed-backend cases.
 
-Do not encode backend-private parameters into `FNACCKernelABI`. Report them via
+Do not encode backend-private parameters into `FnACCKernelABI`. Report them via
 the private-argument contract so the stable ABI remains usable by Triton,
 direct PTX, CUDA Tile IR, and future backends.
 
@@ -1010,7 +1038,7 @@ direct PTX, CUDA Tile IR, and future backends.
 
 Update these as one atomic change:
 
-- runtime-call creation in `FNACCLowerToRuntime.cpp`;
+- runtime-call creation in `FnACCLowerToRuntime.cpp`;
 - exported runtime function signature;
 - JSON parameter roles/types when relevant;
 - driver PTX/image ABI validation;
@@ -1022,14 +1050,14 @@ All CUDA-owned objects must stay in the state keyed by the active `CUcontext`.
 
 ## Diagnostics and troubleshooting
 
-### `FNACC cannot plan launch`
+### `FnACC cannot plan launch`
 
 The region is outside the recognised subset. Read the final recognition reason
 first; common causes are a noncanonical loop, unsupported expression or call,
 too many arrays/scalars, mixed types, non-rank-one reduction access, unconsumed
 side effect, or unsupported mutable scalar.
 
-### `FNACC backend selection failed`
+### `FnACC backend selection failed`
 
 The preferred backend is unregistered or its `querySupport` rejected the plan.
 Use `--fnacc-backend triton`, allow a Triton fallback, or inspect the detailed
@@ -1045,7 +1073,7 @@ command directly. Inspect the `.fir`, `.kernels.ttir`, `.kernels.json`, and
 ### CUDA context initialization errors
 
 The runtime must call `cuInit(0)` before querying the current context. Ensure
-the executable is linked against the rebuilt `FortranFNACCRuntime`, not an old
+the executable is linked against the rebuilt `FortranFnACCRuntime`, not an old
 copy found earlier in a library or runtime search path. With
 `FNACC_USE_CURRENT_CONTEXT=1`, ensure the caller has already made a valid
 context current.

@@ -67,11 +67,9 @@ Compatibility aliases:
   --f64-matmul-strategy, --cuda-lib-dir, --workdir, --keep,
   --verbose, --dry-run, and --stop-after are accepted as aliases.
 
-Limitations:
-  The current runtime accepts one embedded FNACC kernel bundle per executable.
-  The driver rejects links containing more than one FNACC-bearing object rather
-  than producing a binary that aborts during startup. Ordinary objects and
-  sources are unrestricted. Auto-detection scans named objects and archives;
+Linking:
+  Multiple FNACC sources, objects, and archives may contribute embedded kernel
+  bundles to one executable. Auto-detection scans named objects and archives;
   use --fnacc-runtime when FNACC code is supplied only through -lNAME.
 
 Environment:
@@ -269,12 +267,6 @@ extern void __fnacc_register_embedded_device_bundle(
     size_t imageCount,
     const char *jsonData,
     size_t jsonSize);
-
-// The runtime currently owns one process-wide bundle.  Keeping a strong marker
-// in every fat object makes an unsupported multi-bundle link fail immediately,
-// including when a linker other than this driver is used.
-__attribute__((used, visibility("default")))
-const unsigned char __fnacc_single_embedded_bundle = 1;
 
 {chr(10).join(chunks)}
 
@@ -1346,10 +1338,6 @@ for value in "${SOURCE_IS_FNACC[@]}"; do
   (( FNACC_SOURCE_COUNT += value )) || true
 done
 
-if [[ "$COMPILE_ONLY" != "1" && "$FNACC_SOURCE_COUNT" -gt 1 ]]; then
-  die "the current runtime supports one FNACC source bundle per final link; compile/link one FNACC source and any number of ordinary sources"
-fi
-
 if [[ -n "$STOP_AFTER" && "$FNACC_SOURCE_COUNT" -ne 1 ]]; then
   die "--fnacc-stop-after requires exactly one FNACC source"
 fi
@@ -1544,7 +1532,7 @@ compile_fnacc_source() {
   maybe_stop fir
 
   log "  [3/9] Run FNACC pipeline"
-  run "$FIROPT" \
+  run env "FNACC_KERNEL_BUNDLE_KEY=$source_hash" "$FIROPT" \
     "--fnacc-pipeline=ttir-output=$ttir json-output=$json \
       emit-fortran-aliases=true \
       num-warps=$NUM_WARPS \
@@ -1783,7 +1771,6 @@ done
 
 resolve_nm
 NEEDS_FNACC_RUNTIME="$FORCE_RUNTIME"
-BUNDLE_COUNT="$FNACC_SOURCE_COUNT"
 if (( FNACC_SOURCE_COUNT > 0 )); then
   NEEDS_FNACC_RUNTIME=1
 fi
@@ -1792,13 +1779,7 @@ for input in "${OTHER_INPUTS[@]}"; do
   if input_needs_fnacc_runtime "$input"; then
     NEEDS_FNACC_RUNTIME=1
   fi
-  existing_bundles="$(count_embedded_bundles "$input")"
-  (( BUNDLE_COUNT += existing_bundles )) || true
 done
-
-if (( BUNDLE_COUNT > 1 )); then
-  die "link contains $BUNDLE_COUNT embedded FNACC bundles; the current runtime supports one. Combine FNACC kernels into one source/module before compiling"
-fi
 
 RUNTIME_LINK_FLAGS=()
 if [[ "$NEEDS_FNACC_RUNTIME" == "1" && "$DISABLE_RUNTIME" != "1" && "$RELOCATABLE_LINK" != "1" ]]; then

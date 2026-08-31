@@ -109,7 +109,9 @@ Advanced environment:
                            Override TTIR -> TTGIR pass pipeline.
                            Parsed with shell-like quoting.
   FNACC_ALLOW_EMPTY_KERNELS
-                           Allow no recognized kernels in generated JSON.
+                           Allow no recognized kernels even when an FNACC
+                           parallel launch was present. Data-only FNACC
+                           sources are accepted automatically.
                            Default: 0
 EOF
 }
@@ -386,15 +388,14 @@ validate_json() {
   python3 -m json.tool "$json_file" >/dev/null || die "invalid JSON: $json_file"
 }
 
-validate_kernel_json_nonempty() {
+validate_kernel_json() {
   local json_file="$1"
 
-  python3 - "$json_file" "${FNACC_ALLOW_EMPTY_KERNELS:-0}" <<'PY'
+  python3 - "$json_file" <<'PY'
 import json
 import sys
 
 path = sys.argv[1]
-allow_empty = sys.argv[2] == "1"
 with open(path, "r", encoding="utf-8") as f:
     data = json.load(f)
 
@@ -409,10 +410,8 @@ if contract_version is not None and int(contract_version) != 1:
         file=sys.stderr,
     )
     raise SystemExit(1)
-if not kernels and not allow_empty:
-    print(f"fnacc-flang: error: no kernels were emitted into {path}", file=sys.stderr)
-    print("This usually means no FNACC launch was recognized.", file=sys.stderr)
-    print("Set FNACC_ALLOW_EMPTY_KERNELS=1 to allow this.", file=sys.stderr)
+if not isinstance(kernels, list):
+    print("fnacc-flang: error: kernel JSON has no kernel list", file=sys.stderr)
     raise SystemExit(1)
 
 for kernel in kernels:
@@ -430,6 +429,23 @@ for kernel in kernels:
             file=sys.stderr,
         )
         raise SystemExit(1)
+PY
+}
+
+kernel_json_count() {
+  local json_file="$1"
+
+  python3 - "$json_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+kernels = data.get("kernels", [])
+if not isinstance(kernels, list):
+    raise SystemExit("fnacc-flang: error: kernel JSON has no kernel list")
+print(len(kernels))
 PY
 }
 
@@ -813,6 +829,17 @@ source_has_fnacc() {
   local source="$1"
   [[ "$source" != "-" ]] || return 1
   grep -Eiq '^[[:space:]]*([!c*][[:space:]]*)?\$fnacc([[:space:]]|$)' "$source"
+}
+
+source_has_fnacc_parallel() {
+  local source="$1"
+  [[ "$source" != "-" ]] || return 1
+  grep -Eiq '^[[:space:]]*([!c*][[:space:]]*)?\$fnacc[[:space:]]+parallel([[:space:]]|$)' "$source"
+}
+
+fir_has_fnacc_launch() {
+  local fir_file="$1"
+  grep -Eq '(^|[[:space:]"(])fnacc\.launch([[:space:]"({]|$)' "$fir_file"
 }
 
 sanitize_stem() {
@@ -1504,6 +1531,7 @@ compile_fnacc_source() {
   local fir host_fir host_ll host_obj
   local ttir json split_dir manifest embed_c embed_obj
   local effective_num_warps count
+  local data_only=0
   local selected_backend device_ir_kind device_image_kind used_backend_fallback
   local ki kernel_name kernel_warps kernel_ttir kernel_ttgir kernel_llvm_mlir kernel_ll kernel_ptx
 
@@ -1554,9 +1582,20 @@ compile_fnacc_source() {
     test -s "$json" || die "JSON was not generated: $json"
     test -s "$host_fir" || die "host FIR was not generated: $host_fir"
     validate_json "$json"
-    validate_kernel_json_nonempty "$json"
-    IFS=$'\t' read -r selected_backend device_ir_kind device_image_kind used_backend_fallback \
-      < <(read_backend_contract "$json")
+    validate_kernel_json "$json"
+    count="$(kernel_json_count "$json")"
+    if (( count == 0 )); then
+      if fir_has_fnacc_launch "$fir" || source_has_fnacc_parallel "$source"; then
+        if [[ "${FNACC_ALLOW_EMPTY_KERNELS:-0}" != "1" ]]; then
+          die "no kernels were emitted into $json even though an FNACC parallel launch was present; set FNACC_ALLOW_EMPTY_KERNELS=1 to override this check"
+        fi
+        warn "accepting an empty kernel bundle despite an FNACC parallel launch"
+      fi
+      data_only=1
+    else
+      IFS=$'\t' read -r selected_backend device_ir_kind device_image_kind used_backend_fallback \
+        < <(read_backend_contract "$json")
+    fi
   else
     if [[ "$BACKEND" == "auto" || "$BACKEND" == "triton" ]]; then
       selected_backend=triton
@@ -1577,6 +1616,28 @@ compile_fnacc_source() {
     fi
   fi
   maybe_stop fnacc-pipeline
+
+  if (( data_only )); then
+    log "  no device kernels: emitting a host-only FNACC object"
+    log "  [4-9/10] Skip device code generation and kernel embedding"
+    maybe_stop ttgir
+    maybe_stop llvm-mlir
+    maybe_stop llvm-ir
+    maybe_stop ptx
+    maybe_stop embed
+
+    log "  [10/10] Generate host object"
+    run "$TCO" "$host_fir" -o "$host_ll"
+    test -s "$host_ll" || die "host LLVM IR was not generated: $host_ll"
+    maybe_stop host-ll
+
+    run "$CLANG" "${HOST_CODEGEN_FLAGS[@]}" -c "$host_ll" -o "$output"
+    test -s "$output" || die "FNACC object was not generated: $output"
+    maybe_stop host-obj
+    maybe_stop object
+    return
+  fi
+
   log "  selected backend: $selected_backend (device IR=$device_ir_kind, image=$device_image_kind, fallback=$used_backend_fallback)"
 
   case "$selected_backend:$device_ir_kind:$device_image_kind" in

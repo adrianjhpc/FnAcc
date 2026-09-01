@@ -50,6 +50,8 @@ FNACC options:
   --fnacc-f64-matmul-strategy NAME
                            reduce, fma, or dot
   --fnacc-cuda-lib-dir DIR CUDA driver library directory
+  --fnacc-cuda-libdevice FILE
+                           CUDA libdevice bitcode; normally auto-detected
   --fnacc-workdir DIR      Parent for a unique intermediate directory
   --fnacc-keep             Keep intermediate files
   --fnacc-verbose          Print commands before running them
@@ -64,7 +66,7 @@ FNACC options:
 
 Compatibility aliases:
   --sm, --num-warps, --threads-per-warp, --num-stages,
-  --f64-matmul-strategy, --cuda-lib-dir, --workdir, --keep,
+  --f64-matmul-strategy, --cuda-lib-dir, --cuda-libdevice, --workdir, --keep,
   --verbose, --dry-run, and --stop-after are accepted as aliases.
 
 Linking:
@@ -77,6 +79,8 @@ Environment:
   TRITON_OPT               path to triton-opt
   MLIR_TRANSLATE           path to mlir-translate
   LLC                      path to llc
+  LLVM_LINK                path to llvm-link; defaults to LLVM_BUILD/bin
+  OPT                      path to opt; defaults to LLVM_BUILD/bin
   CUDA_LIB_DIR             Optional CUDA driver library directory
 
 Optional environment:
@@ -88,6 +92,10 @@ Optional environment:
   FNACC_FALLBACK_BACKEND   fallback backend, defaults to triton
   FNACC_ALLOW_BACKEND_FALLBACK
                            boolean; defaults to true
+  FNACC_CUDA_LIBDEVICE     CUDA libdevice.10.bc override. Required only when
+                           generated device IR references __nv_* functions.
+  CUDA_HOME, CUDA_PATH, CUDAToolkit_ROOT
+                           CUDA roots considered during libdevice discovery.
   FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
   FNACC_CUDA_DEVICE        CUDA device ordinal; may be changed between calls.
   FNACC_USE_CURRENT_CONTEXT
@@ -365,7 +373,7 @@ write_toolchain_manifest() {
   {
     printf 'generated_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     local tool path
-    for tool in FLANG FIROPT TCO CLANG TRITON_OPT MLIR_TRANSLATE LLC; do
+    for tool in FLANG FIROPT TCO CLANG TRITON_OPT MLIR_TRANSLATE LLVM_LINK OPT LLC; do
       path="${!tool}"
       printf '%s=%q\n' "$tool" "$path"
       printf '%s_VERSION=' "$tool"
@@ -380,6 +388,7 @@ write_toolchain_manifest() {
     printf 'BACKEND_REQUESTED=%s\nBACKEND_FALLBACK=%s\nALLOW_BACKEND_FALLBACK=%s\n' \
       "$BACKEND" "$FALLBACK_BACKEND" \
       "$ALLOW_BACKEND_FALLBACK"
+    printf 'CUDA_LIBDEVICE=%q\n' "$CUDA_LIBDEVICE"
   } > "$output"
 }
 
@@ -492,6 +501,147 @@ require_triton_toolchain() {
   require_exe "$TRITON_OPT"
   require_exe "$MLIR_TRANSLATE"
   require_exe "$LLC"
+}
+
+llvm_ir_requires_cuda_libdevice() {
+  local input="$1"
+
+  python3 - "$input" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], "r", encoding="utf-8").read()
+pattern = r'(?m)^\s*declare\b[^\n]*@(?:"?__nv_[A-Za-z0-9_.$]+"?)\s*\('
+raise SystemExit(0 if re.search(pattern, text) else 1)
+PY
+}
+
+resolve_cuda_libdevice() {
+  if [[ -n "$CUDA_LIBDEVICE" ]]; then
+    [[ -f "$CUDA_LIBDEVICE" ]] ||
+      die "CUDA libdevice bitcode does not exist: $CUDA_LIBDEVICE"
+    return
+  fi
+
+  local root candidate ptxas_path clang_resource
+  local -a roots=()
+
+  for root in "${CUDA_HOME:-}" "${CUDA_PATH:-}" \
+              "${CUDAToolkit_ROOT:-}" "${CUDA_ROOT:-}"; do
+    [[ -n "$root" ]] && roots+=("$root")
+  done
+
+  if [[ -n "$CUDA_LIB_DIR" ]]; then
+    roots+=("$(dirname "$CUDA_LIB_DIR")")
+  fi
+
+  ptxas_path="$(command -v ptxas 2>/dev/null || true)"
+  if [[ -n "$ptxas_path" ]]; then
+    ptxas_path="$(readlink -f "$ptxas_path" 2>/dev/null || printf '%s' "$ptxas_path")"
+    roots+=("$(dirname "$(dirname "$ptxas_path")")")
+  fi
+
+  clang_resource="$("$CLANG" --print-resource-dir 2>/dev/null || true)"
+  roots+=("/usr/local/cuda")
+
+  for root in "${roots[@]}"; do
+    for candidate in \
+      "$root/nvvm/libdevice/libdevice.10.bc" \
+      "$root/lib/nvvm/libdevice/libdevice.10.bc" \
+      "$root/libdevice/libdevice.10.bc"; do
+      if [[ -f "$candidate" ]]; then
+        CUDA_LIBDEVICE="$candidate"
+        return
+      fi
+    done
+  done
+
+  if [[ -n "$clang_resource" ]]; then
+    for candidate in \
+      "$clang_resource/lib/nvptx64-nvidia-cuda/libdevice.10.bc" \
+      "$clang_resource/lib/libdevice.10.bc"; do
+      if [[ -f "$candidate" ]]; then
+        CUDA_LIBDEVICE="$candidate"
+        return
+      fi
+    done
+  fi
+
+  candidate="/usr/lib/nvidia-cuda-toolkit/libdevice/libdevice.10.bc"
+  if [[ -f "$candidate" ]]; then
+    CUDA_LIBDEVICE="$candidate"
+    return
+  fi
+
+  die "generated CUDA device IR references __nv_* functions, but libdevice.10.bc was not found; set FNACC_CUDA_LIBDEVICE or pass --fnacc-cuda-libdevice"
+}
+
+link_cuda_libdevice_if_needed() {
+  local input="$1"
+  local linked_output="$2"
+  local optimized_output="$3"
+  local kernel_name="$4"
+
+  if ! llvm_ir_requires_cuda_libdevice "$input"; then
+    return 1
+  fi
+
+  resolve_cuda_libdevice
+  require_exe "$LLVM_LINK"
+  require_exe "$OPT"
+  log "  link CUDA libdevice for $kernel_name"
+  run "$LLVM_LINK" --only-needed "$input" "$CUDA_LIBDEVICE" \
+    -o "$linked_output"
+  test -s "$linked_output" ||
+    die "libdevice-linked LLVM IR was not generated for $kernel_name"
+
+  # CUDA libdevice contains available_externally definitions.  Linking makes
+  # those definitions visible, but they are not emitted as standalone PTX
+  # functions.  Run the normal LLVM optimization pipeline so required
+  # definitions are internalized/inlined before llc.  Without this step llc
+  # can leave calls such as __nv_sqrt as unresolved PTX externs.
+  log "  optimize CUDA libdevice for $kernel_name"
+  run "$OPT" "-passes=default<O3>" "$linked_output" \
+    -o "$optimized_output"
+  test -s "$optimized_output" ||
+    die "libdevice-optimized LLVM IR was not generated for $kernel_name"
+  return 0
+}
+
+validate_no_unresolved_cuda_libdevice_functions() {
+  local ptx="$1"
+  local kernel_name="$2"
+
+  python3 - "$ptx" "$kernel_name" <<'PY'
+import re
+import sys
+
+path, kernel = sys.argv[1:3]
+text = open(path, "r", encoding="utf-8").read()
+names = set()
+for start in re.finditer(r'(?m)^[ \t]*\.extern[ \t]+\.func\b', text):
+    # PTX extern function declarations can span several lines.  The first
+    # semicolon after `.extern .func` terminates the declaration.
+    end = text.find(';', start.start())
+    declaration = text[start.start():end + 1 if end >= 0 else len(text)]
+    match = re.search(r'\b(__nv[A-Za-z0-9_.$]+)\b', declaration)
+    if match:
+        names.add(match.group(1))
+names = sorted(names)
+if names:
+    print(
+        "fnacc-flang: error: PTX for "
+        + kernel
+        + " still contains unresolved CUDA libdevice functions: "
+        + ", ".join(names),
+        file=sys.stderr,
+    )
+    print(
+        "fnacc-flang: error: use LLVM_LINK, OPT, LLC, and libdevice.10.bc from compatible toolchains",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
 }
 
 validate_no_triton_gpu_ops() {
@@ -1066,6 +1216,7 @@ THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-32}"
 NUM_STAGES="${FNACC_NUM_STAGES:-3}"
 F64_MATMUL_STRATEGY="${FNACC_F64_MATMUL_STRATEGY:-reduce}"
 CUDA_LIB_DIR="${CUDA_LIB_DIR:-}"
+CUDA_LIBDEVICE="${FNACC_CUDA_LIBDEVICE:-}"
 WORKDIR_PARENT="${FNACC_WORKDIR:-}"
 
 KEEP=0
@@ -1158,6 +1309,15 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "$1 requires an argument"
       CUDA_LIB_DIR="$2"
       shift 2
+      ;;
+    --fnacc-cuda-libdevice|--cuda-libdevice)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      CUDA_LIBDEVICE="$2"
+      shift 2
+      ;;
+    --fnacc-cuda-libdevice=*|--cuda-libdevice=*)
+      CUDA_LIBDEVICE="${1#*=}"
+      shift
       ;;
     --fnacc-workdir|--workdir)
       [[ $# -ge 2 ]] || die "$1 requires an argument"
@@ -1452,6 +1612,8 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
   CLANG="${CLANG:-$LLVM_BUILD/bin/clang}"
   TRITON_OPT="${TRITON_OPT:-}"
   MLIR_TRANSLATE="${MLIR_TRANSLATE:-}"
+  LLVM_LINK="${LLVM_LINK:-$LLVM_BUILD/bin/llvm-link}"
+  OPT="${OPT:-$LLVM_BUILD/bin/opt}"
   LLC="${LLC:-}"
 
   require_exe "$FIROPT"
@@ -1461,6 +1623,11 @@ fi
 
 if [[ -n "$CUDA_LIB_DIR" && ! -d "$CUDA_LIB_DIR" ]]; then
   die "CUDA library directory does not exist: $CUDA_LIB_DIR"
+fi
+
+if (( FNACC_SOURCE_COUNT > 0 )) && \
+    [[ -n "$CUDA_LIBDEVICE" && ! -f "$CUDA_LIBDEVICE" ]]; then
+  die "CUDA libdevice bitcode does not exist: $CUDA_LIBDEVICE"
 fi
 
 if [[ -n "$WORKDIR_PARENT" && "$WORKDIR_PARENT" =~ [[:space:]] ]]; then
@@ -1533,7 +1700,8 @@ compile_fnacc_source() {
   local effective_num_warps count
   local data_only=0
   local selected_backend device_ir_kind device_image_kind used_backend_fallback
-  local ki kernel_name kernel_warps kernel_ttir kernel_ttgir kernel_llvm_mlir kernel_ll kernel_ptx
+  local ki kernel_name kernel_warps kernel_ttir kernel_ttgir kernel_llvm_mlir
+  local kernel_ll kernel_linked_bc kernel_optimized_bc kernel_codegen_ir kernel_ptx
 
   stem="$(sanitize_stem "$source")"
   source_hash="$(hash_path "$source")"
@@ -1666,7 +1834,14 @@ compile_fnacc_source() {
     maybe_stop llvm-mlir
     quote_cmd "$MLIR_TRANSLATE" --mlir-to-llvmir "<kernel.llvm.mlir>" -o "<kernel.ll>"
     maybe_stop llvm-ir
-    quote_cmd "$LLC" -march=nvptx64 "-mcpu=sm_$SM" "<kernel.ll>" -o "<kernel.ptx>"
+    log "  link CUDA libdevice only for kernels that reference __nv_* functions"
+    quote_cmd "$LLVM_LINK" --only-needed "<kernel.ll>" \
+      "${CUDA_LIBDEVICE:-<cuda>/nvvm/libdevice/libdevice.10.bc}" \
+      -o "<kernel.libdevice-linked.bc>"
+    quote_cmd "$OPT" "-passes=default<O3>" \
+      "<kernel.libdevice-linked.bc>" -o "<kernel.libdevice-opt.bc>"
+    quote_cmd "$LLC" -march=nvptx64 "-mcpu=sm_$SM" \
+      "<kernel.ll-or-libdevice-opt.bc>" -o "<kernel.ptx>"
     maybe_stop ptx
   else
     log "  [4/10] Split TTIR per kernel"
@@ -1747,8 +1922,18 @@ compile_fnacc_source() {
       kernel_name="$(manifest_get "$manifest" "$ki" name)"
       kernel_ll="$(manifest_get "$manifest" "$ki" ll)"
       kernel_ptx="$(manifest_get "$manifest" "$ki" ptx)"
-      run "$LLC" -march=nvptx64 "-mcpu=sm_$SM" "$kernel_ll" -o "$kernel_ptx"
+      kernel_codegen_ir="$kernel_ll"
+      kernel_linked_bc="$kernel_ll.libdevice-linked.bc"
+      kernel_optimized_bc="$kernel_ll.libdevice-opt.bc"
+      if link_cuda_libdevice_if_needed \
+          "$kernel_ll" "$kernel_linked_bc" "$kernel_optimized_bc" \
+          "$kernel_name"; then
+        kernel_codegen_ir="$kernel_optimized_bc"
+      fi
+      run "$LLC" -march=nvptx64 "-mcpu=sm_$SM" \
+        "$kernel_codegen_ir" -o "$kernel_ptx"
       test -s "$kernel_ptx" || die "PTX was not generated for $kernel_name"
+      validate_no_unresolved_cuda_libdevice_functions "$kernel_ptx" "$kernel_name"
     done
     validate_ptx_kernel_abi "$manifest" "$json"
     maybe_stop ptx

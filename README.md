@@ -6,9 +6,10 @@ deliberately similar to OpenACC and OpenMP offload, while its compiler path is
 built directly into LLVM Flang.
 
 The current production backend uses [Triton](https://triton-lang.org/) to
-generate NVIDIA GPU code. Kernel recognition, launch planning, metadata, and
-the host runtime interface are backend-neutral so that other code-generation
-backends can be added without changing the Fortran programming model.
+generate code for NVIDIA GPUs through CUDA and AMD GPUs through HIP/ROCm.
+Kernel recognition, launch planning, metadata, and the host runtime interface
+are backend-neutral so that other code-generation backends and accelerator
+targets can be added without changing the Fortran programming model.
 
 The FnACC compiler changes currently live on the
 [FnACC branch of the LLVM fork](https://github.com/adrianjhpc/llvm-project/tree/FnACC).
@@ -23,6 +24,7 @@ The compiler driver lives in a separate repository.
 
 - [Current capabilities](#current-capabilities)
 - [Compilation pipeline](#compilation-pipeline)
+- [GPU targets](#gpu-targets)
 - [Building the toolchain](#building-the-toolchain)
 - [Quick start](#quick-start)
 - [Programming model](#programming-model)
@@ -73,22 +75,27 @@ FnACC currently provides:
 - explicit-shape, assumed-shape, pointer/heap-backed, and allocatable arrays
   when their storage is contiguous;
 - multiple separately compiled embedded FnACC bundles in one executable;
-- per-device and per-CUDA-context runtime state; and
+- initial end-to-end NVIDIA CUDA and AMD HIP/ROCm target support;
+- embedded PTX images for CUDA and HSACO images for HIP;
+- per-device and per-accelerator-context runtime state; and
 - a backend-neutral kernel plan and artifact contract, with Triton as the only
-  complete code-generation backend at present.
+  complete code-generation backend at present and CUDA and HIP as its
+  supported accelerator targets.
 
 ## Compilation pipeline
 
-The implemented end-to-end path is:
+The implemented end-to-end paths are:
 
 ```text
 Fortran + !$fnacc
   -> Flang parse tree and semantics
   -> FIR with fnacc.launch and FnACC data operations
   -> kernel recognition and backend-neutral planning
-  -> Triton TTIR -> TTGIR -> LLVM MLIR -> LLVM IR -> PTX
+  -> Triton TTIR -> target-specific TTGIR -> LLVM MLIR -> LLVM IR
+       CUDA: NVPTX + CUDA libdevice -> PTX
+       HIP:  AMDGPU + OCML/OCKL/control bitcode -> object -> HSACO
   -> embedded typed device-image/JSON bundle
-  -> host object + FnACC CUDA Driver API runtime
+  -> host object + matching FnACC CUDA Driver API or HIP runtime
 ```
 
 The recogniser is intentionally fail-closed. A `parallel` region is compiled
@@ -96,11 +103,38 @@ only when every relevant operation can be represented in the selected kernel
 plan. Unsupported work is not silently discarded or left to execute on the
 host.
 
+## GPU targets
+
+The code-generation backend and accelerator target are separate choices.
+`--fnacc-backend triton` selects the kernel code generator;
+`--fnacc-target cuda|hip` selects the device toolchain, image format, and host
+runtime.
+
+| Target | Architecture example | Subgroup width | Embedded image | Runtime library |
+| --- | --- | --- | --- | --- |
+| `cuda` | `sm_90a` | `32` | PTX | `FortranFNACCRuntime` + CUDA Driver API |
+| `hip` | `gfx90a`, `gfx942` | `64` for `gfx9*` by default; otherwise `32` | HSACO | `FortranFNACCRuntimeHIP` + `libamdhip64` |
+
+CUDA remains the default target for compatibility. Select AMD explicitly:
+
+```sh
+fnacc-flang --fnacc-target hip --fnacc-gpu-arch gfx942 ...
+```
+
+`--fnacc-target` also accepts `nvidia`, `amd`, and `rocm` as normalized
+spellings. `--fnacc-sm` remains the CUDA compatibility option, while
+`--fnacc-amd-arch` is an AMD compatibility spelling for
+`--fnacc-target hip --fnacc-gpu-arch ARCH`.
+
+All FnACC-bearing objects linked into one executable must target the same
+accelerator platform. The final link invocation must use the same
+`--fnacc-target` so that the driver selects the matching runtime library.
+
 ## Building the toolchain
 
 ### Required tools
 
-The driver needs an FnACC-enabled LLVM/Flang build and a matching Triton
+The driver needs an FnACC-enabled LLVM/Flang build and a matching Triton/LLVM
 lowering toolchain:
 
 ```sh
@@ -108,19 +142,40 @@ export LLVM_BUILD=/path/to/llvm-project/build
 export TRITON_OPT=/path/to/triton-opt
 export MLIR_TRANSLATE=/path/to/triton-llvm/build/bin/mlir-translate
 export LLC=/path/to/triton-llvm/build/bin/llc
-
-# Optional when libcuda is not in the default linker search path.
-export CUDA_LIB_DIR=/usr/local/cuda/lib64
+export LLVM_LINK="$LLVM_BUILD/bin/llvm-link"
+export OPT="$LLVM_BUILD/bin/opt"
 ```
 
-Configure the LLVM tree with the FnACC CUDA runtime enabled:
+For CUDA, make the CUDA Driver API and libdevice installation discoverable:
 
 ```sh
-cmake -S llvm -B build -DFLANG_FNACC_RUNTIME=ON
+# Optional when libcuda is not in the default linker search path.
+export CUDA_LIB_DIR=/usr/local/cuda/lib64
+
+# Usually auto-detected; set this only when necessary.
+export FNACC_CUDA_LIBDEVICE=/usr/local/cuda/nvvm/libdevice/libdevice.10.bc
 ```
 
-Add the option to the rest of the LLVM/Flang configuration used for your
-build.
+For HIP, provide a ROCm installation and `ld.lld`:
+
+```sh
+export ROCM_PATH=/opt/rocm
+export LD_LLD="$ROCM_PATH/llvm/bin/ld.lld"
+```
+
+Configure one or both runtime targets:
+
+```sh
+cmake -S llvm -B build \
+  -DFLANG_FNACC_RUNTIME=ON \
+  -DFLANG_FNACC_RUNTIME_BACKEND=BOTH
+```
+
+`FLANG_FNACC_RUNTIME_BACKEND` accepts `CUDA`, `HIP`, or `BOTH` and defaults to
+`CUDA`. A HIP or `BOTH` build must find `hip/hip_runtime_api.h` and
+`libamdhip64`; set `ROCM_PATH`, `HIP_PATH`, `HIP_DRIVER_INCLUDE_DIR`, or
+`HIP_DRIVER_LIBRARY` when they are outside normal locations. A CUDA or `BOTH`
+build must find the CUDA driver headers and library.
 
 `FLANG_FNACC=ON` remains a compatibility spelling when
 `FLANG_FNACC_RUNTIME` is not set explicitly.
@@ -129,11 +184,11 @@ Typical rebuild targets are:
 
 ```sh
 cmake --build "$LLVM_BUILD" \
-  --target fir-opt flang FortranFNACCRuntime
+  --target fir-opt flang FortranFNACCRuntime FortranFNACCRuntimeHIP
 ```
 
-The CUDA driver headers and library must be discoverable when the runtime is
-enabled.
+When only one target was configured, omit the other runtime target from the
+build command.
 
 ## Quick start
 
@@ -177,11 +232,22 @@ program example
 end program
 ```
 
-Compile, link, and run it with:
+Compile, link, and run it on NVIDIA CUDA (the default target):
 
 ```sh
-/path/to/FnAcc/bin/fnacc-flang example.f90 -O3 -o example
-FNACC_CUDA_DEVICE=0 ./example
+/path/to/FnAcc/bin/fnacc-flang \
+  --fnacc-target cuda --fnacc-gpu-arch sm_90a \
+  example.f90 -O3 -o example
+FNACC_DEVICE=0 ./example
+```
+
+Compile the same source for AMD HIP/ROCm:
+
+```sh
+/path/to/FnAcc/bin/fnacc-flang \
+  --fnacc-target hip --fnacc-gpu-arch gfx942 \
+  example.f90 -O3 -o example
+FNACC_DEVICE=0 ./example
 ```
 
 For separate compilation:
@@ -194,7 +260,8 @@ fnacc-flang main.o kernels.o -o example
 
 FnACC objects are conventional relocatable objects. Each can contain its own
 embedded device bundle, and multiple bundles may be linked into the same
-executable.
+executable. For HIP, repeat `--fnacc-target hip` on every FnACC compilation and
+on the final link so the driver selects `FortranFNACCRuntimeHIP`.
 
 ## Programming model
 
@@ -239,20 +306,22 @@ ranges are represented by a zero trip count.
 Matrix multiplication remains more restrictive: all three canonical loop
 lower bounds must currently be the constant `1`.
 
-### Logical tile versus CUDA block size
+### Logical tile versus hardware block size
 
 `tile(...)` describes the logical number of elements handled by one device
-program in each dimension. It is not the CUDA thread-block size.
+program in each dimension. It is not the CUDA thread-block size or HIP workgroup
+size.
 
-The CUDA block size comes from the selected schedule:
+The hardware block size comes from the selected schedule:
 
 ```text
-cuda_threads_per_cta = num_warps * threads_per_warp
+threads_per_cta = num_warps * threads_per_warp
 ```
 
 CUDA currently requires `threads_per_warp=32`. A one-dimensional tile of 1024
 with one warp therefore means that 32 CUDA threads cooperate to process 1024
-logical elements.
+logical elements. HIP accepts subgroup widths of `32` or `64`; the driver
+defaults `gfx9*` architectures to wave64 and later architectures to wave32.
 
 Default logical tiles are:
 
@@ -263,8 +332,9 @@ Default logical tiles are:
 | f32 matrix multiplication | `16, 16, 32` |
 | f64 matrix multiplication | `16, 16, 8` |
 
-Use `FNACC_DEBUG=1` to print the grid, logical tile, and CUDA block selected for
-each launch. The generated per-kernel JSON is the authoritative schedule.
+Use `FNACC_DEBUG=1` to print the grid, logical tile, subgroup, and hardware
+block selected for each launch. The generated per-kernel JSON is the
+authoritative schedule.
 
 ## Directive reference
 
@@ -369,7 +439,7 @@ This is convenient for isolated kernels but expensive for repeated launches.
 ### Persistent placement
 
 `pack(...:device)`, `enter data`, `create`, and `update device` can establish a
-persistent allocation keyed by the host data address in the active CUDA
+persistent allocation keyed by the host data address in the active accelerator
 context.
 
 Once an allocation is present, subsequent launches use it automatically even
@@ -385,7 +455,7 @@ During a persistent lifetime:
 - host writes are invisible until `update device`;
 - device writes are invisible on the host until an automatic copyback,
   `update host`, or final-owner `copyout`; and
-- the allocation remains local to its CUDA context.
+- the allocation remains local to its CUDA or HIP context.
 
 ### `no_copyback`
 
@@ -419,9 +489,9 @@ The selected behavior is recorded in kernel JSON as
 ```
 
 It is useful at procedure boundaries to catch a missing enclosing data region.
-Every object must already be present in the active CUDA context; otherwise the
-runtime reports an error. `present` neither acquires nested-region ownership
-nor performs a transfer.
+Every object must already be present in the active accelerator context;
+otherwise the runtime reports an error. `present` neither acquires
+nested-region ownership nor performs a transfer.
 
 ### Nested data regions
 
@@ -484,21 +554,22 @@ before its next device consumer.
 
 ### Synchronization
 
-The runtime owns one nonblocking CUDA stream and one completion event per CUDA
-context. Work submitted through the same context is ordered in that stream.
+The runtime owns one nonblocking CUDA or HIP stream and one completion event
+per accelerator context. Work submitted through the same context is ordered in
+that stream.
 
 Use `!$fnacc wait`:
 
 - before host code that needs completion but not a host transfer;
-- before external CUDA work whose stream has no explicit dependency on the
-  FnACC stream;
+- before external CUDA or HIP work whose stream has no explicit dependency on
+  the FnACC stream;
 - as a phase boundary before changing device or context ownership; or
 - in tests that require completion at a precise source point.
 
 Host updates, final copyouts, reductions that return host scalars, releases,
 and host-target launch paths are synchronization points in the current
 runtime. `wait` covers only the active FnACC context and its runtime stream; it
-does not synchronize unrelated CUDA contexts or caller-created streams.
+does not synchronize unrelated CUDA/HIP contexts or caller-created streams.
 
 ## Supported kernels
 
@@ -740,7 +811,7 @@ synthetic `reduction_stage1d` kernel then reduces those partials recursively
 until one result remains. Fused reductions use a corresponding variadic result
 layout.
 
-Partial and scratch buffers are cached as grow-only workspaces per CUDA
+Partial and scratch buffers are cached as grow-only workspaces per accelerator
 context. Repeated reductions reuse those allocations.
 
 ```sh
@@ -790,13 +861,16 @@ For an FnACC source, `fnacc-flang` performs:
 5. TTIR-to-TritonGPU lowering;
 6. TritonGPU-to-LLVM-MLIR lowering;
 7. LLVM-MLIR-to-LLVM-IR translation;
-8. LLVM-IR-to-PTX compilation;
+8. target-specific device-library linking and image generation:
+   - CUDA links libdevice when required and emits PTX with NVPTX `llc`;
+   - HIP links OCML/OCKL and ROCm control bitcode, emits an AMDGPU object,
+     and links HSACO with `ld.lld`;
 9. device-image and JSON embedding; and
 10. host-object generation followed by a relocatable link.
 
 The result of `-c` is a conventional relocatable object containing host code,
 the embedded device bundle, metadata, and its registration constructor. No
-sidecar PTX or JSON files are required at run time.
+sidecar PTX, HSACO, or JSON files are required at run time.
 
 ### Data-only FnACC sources
 
@@ -833,15 +907,18 @@ point, allowing mixed FnACC/plain object links.
 
 ### Runtime linking
 
-When it detects FnACC code, the driver adds the equivalent of:
+When it detects FnACC code, the driver adds the runtime matching
+`--fnacc-target`:
 
 ```text
--L$LLVM_BUILD/lib -lFortranFNACCRuntime -lcuda -lstdc++
+cuda: -L$LLVM_BUILD/lib -lFortranFNACCRuntime    -lcuda     -lstdc++
+hip:  -L$LLVM_BUILD/lib -lFortranFNACCRuntimeHIP -lamdhip64 -lstdc++
 ```
 
 with appropriate runtime search paths. Object and archive inputs are scanned
 for FnACC symbols. Use `--fnacc-runtime` when FnACC code is visible only
-through `-lNAME` and cannot be detected from a named input file.
+through `-lNAME` and cannot be detected from a named input file. The link
+target must match the target used to compile every embedded bundle.
 
 ## Compiler-driver reference
 
@@ -859,16 +936,23 @@ Flags are routed to the relevant frontend, host-codegen, or final-link stage.
 | `--fnacc-disable` | Delegate every source to Flang. |
 | `--fnacc-runtime` | Force FnACC runtime libraries into the final link. |
 | `--fnacc-no-runtime` | Do not add the runtime automatically. |
-| `--fnacc-sm N` | NVIDIA target such as `80`, `sm_80`, or `cc80`. |
+| `--fnacc-target NAME` | Accelerator platform: `cuda` (default) or `hip`. The spellings `nvidia`, `amd`, and `rocm` are normalized. |
+| `--fnacc-gpu-arch ARCH` | Target architecture such as `sm_90a`, `gfx90a`, or `gfx942`. |
+| `--fnacc-sm N` | CUDA compatibility option accepting `80`, `sm_80`, `cc80`, or `sm_90a`. |
+| `--fnacc-amd-arch ARCH` | Compatibility spelling that selects HIP and an AMD `gfx...` architecture. |
 | `--fnacc-backend NAME` | Preferred backend; default `auto`. |
 | `--fnacc-fallback-backend NAME` | Backend used when the preferred backend rejects a kernel; default `triton`. |
 | `--fnacc-backend-fallback` | Enable fallback; currently the default. |
 | `--fnacc-no-backend-fallback` | Fail instead of using the fallback backend. |
 | `--fnacc-num-warps N` | Requested warps per CTA; a power of two and at most 32. |
-| `--fnacc-threads-per-warp N` | Subgroup width; CUDA currently requires 32. |
+| `--fnacc-threads-per-warp N` | Subgroup width. CUDA requires `32`; HIP accepts `32` or `64`. |
 | `--fnacc-num-stages N` | Triton pipeline stages, currently 1 through 16. |
 | `--fnacc-f64-matmul-strategy NAME` | `reduce`, `fma`, or `dot`. |
 | `--fnacc-cuda-lib-dir DIR` | CUDA Driver API library directory. |
+| `--fnacc-cuda-libdevice FILE` | CUDA `libdevice.10.bc`; normally auto-detected. |
+| `--fnacc-rocm-path DIR` | ROCm installation prefix; default `ROCM_PATH` or `/opt/rocm`. |
+| `--fnacc-rocm-device-lib-dir DIR` | Directory containing ROCm device bitcode such as `ocml.bc` and `ockl.bc`. |
+| `--fnacc-hip-lib-dir DIR` | Directory containing `libamdhip64`. |
 | `--fnacc-workdir DIR` | Parent directory for a unique intermediate tree. |
 | `--fnacc-keep` | Keep intermediate files. |
 | `--fnacc-verbose` | Print commands before executing them. |
@@ -879,8 +963,8 @@ Compatibility aliases without the `fnacc-` prefix are accepted for schedule,
 work-directory, verbosity, and stop controls.
 
 Useful stop stages include `modgen`, `fir`, `fnacc-pipeline`, `ttgir`,
-`llvm-mlir`, `llvm-ir`, `ptx`, `embed`, `host-ll`, `host-obj`, `object`,
-`objects`, and `link`.
+`llvm-mlir`, `llvm-ir`, `ptx`, `hsaco`, `device-image`, `embed`, `host-ll`,
+`host-obj`, `object`, `objects`, and `link`.
 
 ```sh
 fnacc-flang --fnacc-verbose --fnacc-keep \
@@ -894,11 +978,21 @@ fnacc-flang --fnacc-verbose --fnacc-keep \
 | `LLVM_BUILD` | FnACC-enabled LLVM/Flang build directory. |
 | `TRITON_OPT` | `triton-opt` executable. |
 | `MLIR_TRANSLATE` | Matching `mlir-translate`. |
-| `LLC` | Matching `llc` used to emit PTX. |
+| `LLC` | Matching `llc` used to emit PTX or an AMDGPU object. |
+| `LLVM_LINK` | Matching `llvm-link`; defaults to `$LLVM_BUILD/bin/llvm-link`. |
+| `OPT` | Matching `opt`; defaults to `$LLVM_BUILD/bin/opt`. |
+| `LD_LLD` | `ld.lld` used to link HSACO; defaults to `$ROCM_PATH/llvm/bin/ld.lld`. |
 | `FLANG`, `FIROPT`, `TCO`, `CLANG` | Optional tool overrides. |
 | `FLANG_INTRINSIC_MODULES_PATH` | Override Flang's intrinsic-module directory. |
 | `CUDA_LIB_DIR` | CUDA Driver API library directory. |
-| `FNACC_SM` | Default NVIDIA target used by the driver. |
+| `FNACC_CUDA_LIBDEVICE` | CUDA `libdevice.10.bc` override. The driver auto-detects it when generated IR references `__nv_*`. |
+| `ROCM_PATH` | ROCm installation prefix; default `/opt/rocm`. |
+| `FNACC_ROCM_DEVICE_LIB_DIR` | ROCm bitcode directory containing OCML/OCKL and control bitcode. |
+| `FNACC_HIP_LIB_DIR` | Directory containing `libamdhip64`; defaults to `$ROCM_PATH/lib` or `lib64`. |
+| `FNACC_TARGET` | Default accelerator target: `cuda` or `hip`. |
+| `FNACC_GPU_ARCH` | Default target architecture such as `sm_90a` or `gfx942`. |
+| `FNACC_SM` | CUDA architecture compatibility variable. |
+| `FNACC_AMD_GPU_ARCH` | AMD architecture compatibility variable; default `gfx90a` when HIP is selected and no architecture is supplied. |
 | `FNACC_BACKEND` | Preferred backend; default `auto`. |
 | `FNACC_FALLBACK_BACKEND` | Fallback backend; default `triton`. |
 | `FNACC_ALLOW_BACKEND_FALLBACK` | Boolean backend-fallback control. |
@@ -909,6 +1003,8 @@ fnacc-flang --fnacc-verbose --fnacc-keep \
 | `FNACC_WORKDIR` | Intermediate-directory parent. |
 | `FNACC_TTIR_TO_TTGIR_PASSES` | Advanced TTIR-to-TTGIR pass-pipeline override. |
 | `FNACC_TTGIR_TO_LLVM_PASSES` | Advanced TTGIR-to-LLVM-MLIR pass-pipeline override. |
+| `FNACC_HIP_TTIR_TO_TTGIR_PASSES` | HIP-only TTIR-to-TritonGPU pass-pipeline override. |
+| `FNACC_HIP_TTGIR_TO_LLVM_PASSES` | HIP-only TritonGPU-to-LLVM-MLIR pass-pipeline override. |
 | `FNACC_ALLOW_EMPTY_KERNELS` | Permit an empty kernel list despite an FnACC `parallel` launch; default false. Data-only sources do not need it. |
 
 The work directory must be writable and contain no whitespace because some
@@ -919,34 +1015,38 @@ intermediate paths.
 
 | Variable | Purpose |
 | --- | --- |
-| `FNACC_CUDA_DEVICE` | CUDA device ordinal. Default `0`; may change between runtime calls. |
-| `FNACC_USE_CURRENT_CONTEXT` | Use the caller's current CUDA context instead of retaining a primary context. |
+| `FNACC_DEVICE` | Device ordinal for either runtime. Takes precedence over the vendor-specific variable; default `0`. |
+| `FNACC_CUDA_DEVICE` | CUDA device ordinal when `FNACC_DEVICE` is unset. |
+| `FNACC_HIP_DEVICE` | HIP device ordinal when `FNACC_DEVICE` is unset. |
+| `FNACC_USE_CURRENT_CONTEXT` | Use the caller's current CUDA or HIP context instead of retaining a primary context. |
 | `FNACC_DEBUG` | Print initialization, bundle, cache, data-region, launch, grid, tile, ABI, and reduction diagnostics. |
 | `FNACC_REDUCTION_STATS` | Print aggregate reduction-workspace counters at exit. |
 | `FNACC_MATMUL_SHARED_BYTES` | Advanced f32 matmul dynamic-shared-memory override; cannot be below the computed safe minimum. |
 | `FNACC_MATMUL_F64_SHARED_BYTES` | Advanced f64 matmul dynamic-shared-memory override; cannot be below the computed safe minimum. |
-| `FNACC_PTX_DIR`, `FNACC_PTX`, `FNACC_KERNELS_JSON` | Legacy external-bundle debugging fallbacks. Driver-built objects normally use embedded images and JSON. |
+| `FNACC_PTX_DIR`, `FNACC_PTX`, `FNACC_KERNELS_JSON` | Legacy CUDA external-bundle debugging fallbacks. Driver-built objects normally use embedded images and JSON. |
 
-### CUDA context behavior
+### Accelerator context behavior
 
-By default the runtime calls `cuInit(0)`, selects `FNACC_CUDA_DEVICE`, retains
-that device's primary context, and restores the caller's previous current
-context on return.
+The CUDA build uses the CUDA Driver API; the HIP build uses an internal adapter
+over the HIP runtime/module APIs. By default each initializes its platform,
+selects `FNACC_DEVICE` or the vendor-specific device variable, retains the
+device's primary context, and restores the caller's previous current context on
+return.
 
-With `FNACC_USE_CURRENT_CONTEXT=1`, the caller must make a CUDA context current
-before entering FnACC. Runtime state is created for that exact context and the
-runtime does not retain or release it. Using the option with no current context
-is a fatal error.
+With `FNACC_USE_CURRENT_CONTEXT=1`, the caller must make a context for the
+selected platform current before entering FnACC. Runtime state is created for
+that exact context and the runtime does not retain or release it. Using the
+option with no current context is a fatal error.
 
-CUDA modules, function handles, device allocations, data-region frames,
-streams, events, and reduction workspaces are stored per context and are never
-reused in another context.
+Modules, function handles, device allocations, data-region frames, streams,
+events, and reduction workspaces are stored per context and are never reused in
+another context or accelerator runtime.
 
 ### Thread safety
 
 Public runtime entry points and shared caches are protected by a process-wide
 recursive mutex. Calls from multiple host threads are safe with respect to
-runtime maps and CUDA resource lifetimes, but host-side runtime entry is
+runtime maps and CUDA/HIP resource lifetimes, but host-side runtime entry is
 currently serialized. This is correctness-oriented thread safety, not
 concurrent multi-stream execution.
 
@@ -965,7 +1065,7 @@ concurrent multi-stream execution.
 | Host runtime lowering | `flang/lib/Optimizer/Dialect/FNACC/FNACCLowerToRuntime.cpp` |
 | External ABI aliases | `flang/lib/Optimizer/Dialect/FNACC/FNACCEmitFortranAliases.cpp` |
 | Pass pipeline | `FNACCPasses.td`, `FNACCPipelines.cpp` |
-| CUDA runtime | `flang/lib/Runtime/FNACC/fnacc_runtime.cpp` |
+| CUDA/HIP runtimes | `flang/lib/Runtime/FNACC/fnacc_runtime.cpp`, built as `FortranFNACCRuntime` or `FortranFNACCRuntimeHIP` |
 | Compiler wrapper | `FnAcc/bin/fnacc-flang` |
 
 The FIR dialect includes:
@@ -1017,8 +1117,8 @@ The variadic launch interface is built in stages:
 
 The stable public ABI includes array pointers and layout metadata, scalar and
 index values, loop extents and lower bounds, and reduction outputs. Backend
-private arguments are excluded. Triton/NVVM currently records its private
-pointer count separately in metadata.
+private arguments are excluded. The Triton target lowering records its private
+pointer count separately in metadata for both CUDA and HIP images.
 
 ## Backend artifact contract
 
@@ -1035,21 +1135,23 @@ reduction-stage plans.
 - module framing and kernel emission; and
 - the count of backend-private pointer arguments.
 
-The only complete backend currently registered is `triton`. Selection supports
-`auto`, a named preferred backend, an optional fallback, and detailed fallback
-diagnostics. Mixed backends within one emitted device module are not yet
-supported.
+The only complete code-generation backend currently registered is `triton`.
+It can emit for the `cuda` or `hip` accelerator target. Backend selection
+supports `auto`, a named preferred backend, an optional fallback, and detailed
+fallback diagnostics. Mixed code-generation backends or accelerator targets
+within one emitted device module are not supported.
 
 ### JSON metadata
 
-Schema version 1 and backend-contract version 1 include top-level backend and
-image fields plus a list of kernel descriptors. Each descriptor records:
+Schema version 1 and backend-contract version 1 include top-level backend,
+accelerator-target, and image fields plus a list of kernel descriptors. Each
+descriptor records:
 
 - stable bundle-qualified `id` and `name`;
-- backend, device-IR kind, and device-image kind;
+- backend, accelerator target, device-IR kind, and device-image kind;
 - image index and file;
 - kernel kind and rank;
-- logical tile, warp/stage schedule, and CUDA CTA size;
+- logical tile, warp/stage schedule, subgroup width, and threads per CTA;
 - launch ABI version;
 - array, scalar, output, and reduction-result counts;
 - parameter roles, slots, names, types, array dimensions, and layout fields;
@@ -1063,10 +1165,15 @@ retired.
 
 ### Runtime images
 
-The typed registration ABI accepts PTX and cubin images. The normal Triton
-driver path emits PTX. A future direct-PTX, CUDA Tile IR, or other backend may
-reuse the kernel plan, public ABI, metadata, embedding, and runtime dispatch
-layers, but its driver must still produce a runtime-supported image.
+The typed registration ABI accepts PTX, cubin, and HSACO images. The normal
+Triton CUDA path emits PTX; the Triton HIP path emits an AMDGPU object and links
+it into HSACO. The CUDA runtime rejects HIP/HSACO metadata, and the HIP runtime
+rejects CUDA/PTX or cubin metadata, preventing an image from being loaded by
+the wrong platform runtime.
+
+A future direct-PTX, CUDA Tile IR, or other backend may reuse the kernel plan,
+public ABI, metadata, embedding, and runtime dispatch layers, but its driver
+must still produce an image supported by the selected runtime.
 
 Adding a compiler backend enum alone is insufficient. Driver dispatch,
 manifest/embed logic, runtime loading, contract validation, and tests must be
@@ -1099,7 +1206,7 @@ multi-output expressions, integer and floating-point operations, assumed-shape
 and allocatable descriptors, matmul variants, one- and two-dimensional
 reductions, multi-warp lowering, nested data regions, derived-component data
 designators, `present`, `no_copyback`, data-only sources, external ABI aliases,
-and negative diagnostics.
+CUDA/HIP accelerator-target JSON and image metadata, and negative diagnostics.
 
 Prefer `CHECK-LABEL`, `CHECK-NEXT`, bounded `CHECK`, and `CHECK-DAG` patterns to
 fragile `CHECK-SAME` assertions when operations are intentionally printed on
@@ -1122,6 +1229,27 @@ ctest --test-dir build/reduction -V
 
 Configure with `-DFNACC_NUM_WARPS=4` to exercise multi-warp reductions.
 
+### CUDA and HIP smoke tests
+
+After building the selected runtime, compile and run a small numerical kernel
+on each available target before testing a full application:
+
+```sh
+# NVIDIA
+fnacc-flang --fnacc-target cuda --fnacc-gpu-arch sm_90a \
+  vector_add.f90 -O3 -o vector_add.cuda
+FNACC_DEBUG=1 FNACC_DEVICE=0 ./vector_add.cuda
+
+# AMD
+fnacc-flang --fnacc-target hip --fnacc-gpu-arch gfx942 \
+  vector_add.f90 -O3 -o vector_add.hip
+FNACC_DEBUG=1 FNACC_DEVICE=0 ./vector_add.hip
+```
+
+Use an architecture that exactly matches the installed GPU. The HIP path is
+particularly sensitive to compatible Triton, LLVM, ROCm device-library, and
+`ld.lld` revisions.
+
 ### Repeated BabelStream measurements
 
 `tools/fnacc-babelstream-stats.py` runs warm-ups and repeated measured trials,
@@ -1142,11 +1270,12 @@ validation error is a failed benchmark regardless of reported bandwidth.
 ### Runtime debugging
 
 ```sh
-fnacc-flang --fnacc-keep --fnacc-verbose -c kernel.f90
-FNACC_DEBUG=1 FNACC_CUDA_DEVICE=0 ./program
+fnacc-flang --fnacc-keep --fnacc-verbose \
+  --fnacc-target TARGET --fnacc-gpu-arch ARCH -c kernel.f90
+FNACC_DEBUG=1 FNACC_DEVICE=0 ./program
 ```
 
-For memory checking:
+For CUDA memory checking:
 
 ```sh
 CUDA_LAUNCH_BLOCKING=1 compute-sanitizer \
@@ -1218,6 +1347,22 @@ indexing, mutation, or ABI has not been proven safe.
 Do not place backend-private parameters in the stable public ABI. Record them
 through the private-argument contract.
 
+### Add an accelerator target
+
+An accelerator target is distinct from a code-generation backend. Adding one
+requires coordinated changes to:
+
+1. the compiler target option and JSON `accelerator_target` contract;
+2. the backend's target-specific image kind and lowering configuration;
+3. driver architecture parsing, device-library linking, image generation, and
+   final runtime selection;
+4. typed bundle image-kind registration;
+5. module, allocation, copy, stream/event, and launch operations in the target
+   runtime; and
+6. target/image mismatch diagnostics and end-to-end device tests.
+
+Do not allow a runtime to accept metadata or images for a different target.
+
 ### Change a runtime ABI
 
 Update these together:
@@ -1229,8 +1374,8 @@ Update these together:
 - compatibility aliases or a schema/ABI version; and
 - MLIR lowering and executable integration tests.
 
-CUDA-owned objects must remain in state keyed by the active `CUcontext`; never
-infer ownership from a process-global device-pointer cache.
+Accelerator-owned objects must remain in state keyed by the active CUDA or HIP
+context; never infer ownership from a process-global device-pointer cache.
 
 ## Diagnostics and troubleshooting
 
@@ -1261,6 +1406,47 @@ Re-run with `--fnacc-verbose --fnacc-keep`, execute the printed `fir-opt`
 command directly, and inspect the retained `.fir`, `.kernels.ttir`,
 `.kernels.json`, and `.host.fir` files.
 
+### PTX reports an unresolved `__nv_*` function
+
+CUDA kernels that use operations such as double-precision square root may
+reference CUDA libdevice. The driver detects these references, links
+`libdevice.10.bc` with `llvm-link`, runs `opt -O3` so required definitions are
+materialized/inlined, and only then invokes NVPTX `llc`.
+
+If `ptxas` still reports an unresolved symbol such as `__nv_sqrt`, ensure
+`LLVM_LINK`, `OPT`, and `LLC` come from compatible LLVM builds and that the
+selected libdevice is compatible with them. Override discovery with
+`--fnacc-cuda-libdevice FILE` or `FNACC_CUDA_LIBDEVICE`, retain intermediates,
+and run `ptxas` on the generated PTX directly.
+
+### HIP/ROCm toolchain errors
+
+For `--fnacc-target hip`, confirm that:
+
+- `--fnacc-gpu-arch` names the installed GPU, for example `gfx90a` or `gfx942`;
+- `ROCM_PATH` points to the intended ROCm installation;
+- `LLC`, `MLIR_TRANSLATE`, and `LD_LLD` are compatible with the Triton build;
+- the device-library directory contains `ocml.bc`, `ockl.bc`, the required
+  `oclc_*` control modules, and an ISA module for the selected `gfx...`; and
+- the final link also uses `--fnacc-target hip` and can find `libamdhip64`.
+
+Override device-library discovery with `--fnacc-rocm-device-lib-dir` and HIP
+runtime discovery with `--fnacc-hip-lib-dir`. If Triton's AMD pass spellings
+differ from the defaults, set `FNACC_HIP_TTIR_TO_TTGIR_PASSES` and/or
+`FNACC_HIP_TTGIR_TO_LLVM_PASSES`.
+
+An error that the AMDGPU object or HSACO was not generated usually indicates a
+target-architecture or LLVM/ROCm version mismatch. Retain intermediates and run
+the printed `llc` and `ld.lld` commands directly.
+
+### Runtime rejects the accelerator target or image kind
+
+CUDA objects carry `accelerator_target=cuda` with PTX/cubin images; HIP objects
+carry `accelerator_target=hip` with HSACO images. A target/image mismatch means
+the object was linked against the wrong FnACC runtime or bundles for different
+targets were mixed. Recompile consistently and repeat the same
+`--fnacc-target` on the final link.
+
 ### `no kernels were emitted`
 
 Data-only FnACC sources are accepted automatically. If the message says that
@@ -1280,8 +1466,8 @@ definitions agree.
 ### `present` or `update host` reports no allocation
 
 The object was never entered into persistent storage, was released by its
-owning data region, belongs to another CUDA context, or was used only through
-a host-temporary launch. Establish storage with `enter data`, `create`,
+owning data region, belongs to another accelerator context, or was used only
+through a host-temporary launch. Establish storage with `enter data`, `create`,
 `update device`, or `pack(...:device)` before asserting presence or updating
 the host.
 
@@ -1327,7 +1513,7 @@ Check the lifetime in this order:
 
 Enable `FNACC_DEBUG=1` and inspect context, bundle, cache, region depth,
 ownership count, pack targets, byte counts, extents, lower bounds, strides,
-grid, tile, CUDA block size, and image metadata.
+grid, tile, subgroup/block size, accelerator target, and image metadata.
 
 ## Known limitations
 
@@ -1343,12 +1529,18 @@ grid, tile, CUDA block size, and image metadata.
 - All output arrays in one kernel must currently have the same element type.
 - Fused multi-result reductions require one common operator and result type.
 - Matrix multiplication supports only f32 and f64.
-- Triton is the only complete code-generation backend. The normal path emits
-  PTX; cubin is accepted by the typed runtime image ABI but is not the normal
-  Triton driver output.
-- Mixed backends in one device module are unsupported.
-- The runtime owns one stream per CUDA context and serializes public entry
-  through a process-wide mutex.
+- Triton is the only complete code-generation backend. Its CUDA path emits PTX
+  and its HIP path emits HSACO. Cubin is accepted by the CUDA typed-image ABI
+  but is not the normal Triton output.
+- CUDA and HIP use separate runtime libraries. Mixing CUDA and HIP bundles in
+  one executable or loading an image through the wrong runtime is unsupported.
+- Mixed code-generation backends or accelerator targets in one device module
+  are unsupported.
+- The runtime owns one stream per CUDA or HIP context and serializes public
+  entry through a process-wide mutex.
+- The HIP path depends on revision-compatible Triton, LLVM, ROCm device
+  libraries, and `ld.lld`; AMD lowering pass names may require the documented
+  environment overrides for a particular Triton revision.
 - There is no source-level `private` clause; only proven iteration-private
   scalar temporaries are promoted automatically.
 - There are no asynchronous queue IDs, user stream clauses, exposed events,
@@ -1364,4 +1556,3 @@ grid, tile, CUDA block size, and image metadata.
   signed zero, and reproducibility when an application depends on them.
 - A frontend control-flow corner case remains for standalone data directives
   reached after certain terminated `do`/`exit` block shapes.
-

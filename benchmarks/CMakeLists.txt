@@ -337,7 +337,7 @@ if(FNACC_ENABLE_FNACC_BENCHMARKS)
     matrix_add_2d_main.f90)
 
   add_fnacc_benchmark(fnacc-matrix-add-2d-f64
-    matrix_add_2d_f64_kernel.f90
+    matrixadd_2d_f64_kernel.f90
     matrix_add_2d_f64_main.f90)
 
   add_fnacc_benchmark(fnacc-matmul-2d
@@ -529,6 +529,7 @@ if(FNACC_ENABLE_OPENACC_BASELINES)
     add_openacc_benchmark(openacc-saxpy saxpy_openacc.f90)
     add_openacc_benchmark(openacc-daxpy daxpy_openacc.f90)
     add_openacc_benchmark(openacc-axpby axpby_openacc.f90)
+    add_openacc_benchmark(openacc-reduction reduction_openacc.f90)
     add_openacc_benchmark(openacc-matrix-add-2d matrix_add_2d_openacc.f90)
     add_openacc_benchmark(openacc-matrix-add-2d-f64 matrix_add_2d_f64_openacc.f90)
     add_openacc_benchmark(openacc-matmul-2d matmul_2d_openacc.f90)

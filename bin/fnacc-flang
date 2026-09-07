@@ -12,7 +12,7 @@ Compiler-driver behavior:
   * Ordinary Fortran sources are compiled by flang with user flags preserved.
   * Sources containing !$fnacc (also c$fnacc and *$fnacc) use the FNACC pipeline.
   * -c produces a normal relocatable object. An FNACC object includes its host
-    code and embedded PTX/JSON, so it can be linked in a later invocation.
+    code and embedded GPU image/JSON, so it can be linked later.
   * Without -c, sources are compiled to temporary objects and then linked with
     user objects, archives, libraries, and linker flags in command-line order.
   * -E, -S, and -fsyntax-only are passed directly to flang. They do not run the
@@ -34,7 +34,10 @@ FNACC options:
   --fnacc-disable          Never run FNACC lowering; delegate sources to flang
   --fnacc-runtime          Force FNACC runtime libraries into the link
   --fnacc-no-runtime       Do not auto-add FNACC runtime libraries
-  --fnacc-sm NUM           CUDA SM version, e.g. 80, sm_80, or cc80
+  --fnacc-target NAME      Accelerator platform: cuda (default) or hip
+  --fnacc-gpu-arch ARCH    GPU architecture: e.g. sm_90a or gfx942
+  --fnacc-sm NUM           CUDA SM compatibility spelling
+  --fnacc-amd-arch ARCH    AMD architecture compatibility spelling
   --fnacc-backend NAME     Preferred code-generation backend; default auto
   --fnacc-fallback-backend NAME
                            Backend used when the preferred backend cannot lower
@@ -52,6 +55,10 @@ FNACC options:
   --fnacc-cuda-lib-dir DIR CUDA driver library directory
   --fnacc-cuda-libdevice FILE
                            CUDA libdevice bitcode; normally auto-detected
+  --fnacc-rocm-path DIR    ROCm installation prefix; default ROCM_PATH or /opt/rocm
+  --fnacc-rocm-device-lib-dir DIR
+                           ROCm device bitcode directory; normally auto-detected
+  --fnacc-hip-lib-dir DIR  HIP runtime library directory
   --fnacc-workdir DIR      Parent for a unique intermediate directory
   --fnacc-keep             Keep intermediate files
   --fnacc-verbose          Print commands before running them
@@ -79,6 +86,7 @@ Environment:
   TRITON_OPT               path to triton-opt
   MLIR_TRANSLATE           path to mlir-translate
   LLC                      path to llc
+  LD_LLD                   path to ld.lld (required for HIP/HSACO)
   LLVM_LINK                path to llvm-link; defaults to LLVM_BUILD/bin
   OPT                      path to opt; defaults to LLVM_BUILD/bin
   CUDA_LIB_DIR             Optional CUDA driver library directory
@@ -88,12 +96,19 @@ Optional environment:
   FNACC_THREADS_PER_WARP   threads per warp, defaults to 32
   FNACC_NUM_STAGES         number of Triton pipeline stages, defaults to 3
   FNACC_SM                 default CUDA SM, default 80
+  FNACC_TARGET             cuda (default) or hip
+  FNACC_GPU_ARCH           target architecture (sm_90a or gfx942)
+  FNACC_AMD_GPU_ARCH       AMD architecture compatibility variable
   FNACC_BACKEND            preferred backend, defaults to auto
   FNACC_FALLBACK_BACKEND   fallback backend, defaults to triton
   FNACC_ALLOW_BACKEND_FALLBACK
                            boolean; defaults to true
   FNACC_CUDA_LIBDEVICE     CUDA libdevice.10.bc override. Required only when
                            generated device IR references __nv_* functions.
+  ROCM_PATH                ROCm installation prefix; default /opt/rocm
+  FNACC_ROCM_DEVICE_LIB_DIR
+                           ROCm bitcode directory containing ocml.bc/ockl.bc
+  FNACC_HIP_LIB_DIR        directory containing libamdhip64
   CUDA_HOME, CUDA_PATH, CUDAToolkit_ROOT
                            CUDA roots considered during libdevice discovery.
   FNACC_WORKDIR            default work directory. If unset, uses a temp dir.
@@ -116,6 +131,9 @@ Advanced environment:
   FNACC_TTIR_TO_TTGIR_PASSES
                            Override TTIR -> TTGIR pass pipeline.
                            Parsed with shell-like quoting.
+  FNACC_HIP_TTIR_TO_TTGIR_PASSES
+  FNACC_HIP_TTGIR_TO_LLVM_PASSES
+                           HIP-specific pass-pipeline overrides.
   FNACC_ALLOW_EMPTY_KERNELS
                            Allow no recognized kernels even when an FNACC
                            parallel launch was present. Data-only FNACC
@@ -233,7 +251,7 @@ chunks = []
 image_array_names = []
 image_kinds = []
 
-kind_values = {"ptx": 1, "cubin": 2}
+kind_values = {"ptx": 1, "cubin": 2, "hsaco": 3}
 kernels_by_name = {
     str(kernel.get("name")): kernel for kernel in metadata.get("kernels", [])
 }
@@ -373,7 +391,7 @@ write_toolchain_manifest() {
   {
     printf 'generated_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     local tool path
-    for tool in FLANG FIROPT TCO CLANG TRITON_OPT MLIR_TRANSLATE LLVM_LINK OPT LLC; do
+    for tool in FLANG FIROPT TCO CLANG TRITON_OPT MLIR_TRANSLATE LLVM_LINK OPT LLC LD_LLD; do
       path="${!tool}"
       printf '%s=%q\n' "$tool" "$path"
       printf '%s_VERSION=' "$tool"
@@ -383,12 +401,15 @@ write_toolchain_manifest() {
         printf '<not configured>\n'
       fi
     done
-    printf 'SM=%s\nNUM_WARPS=%s\nTHREADS_PER_WARP=%s\nNUM_STAGES=%s\n' \
-      "$SM" "$NUM_WARPS" "$THREADS_PER_WARP" "$NUM_STAGES"
+    printf 'ACCELERATOR_TARGET=%s\nGPU_ARCH=%s\nSM=%s\nNUM_WARPS=%s\nTHREADS_PER_WARP=%s\nNUM_STAGES=%s\n' \
+      "$ACCELERATOR_TARGET" "$GPU_ARCH" "$SM" "$NUM_WARPS" \
+      "$THREADS_PER_WARP" "$NUM_STAGES"
     printf 'BACKEND_REQUESTED=%s\nBACKEND_FALLBACK=%s\nALLOW_BACKEND_FALLBACK=%s\n' \
       "$BACKEND" "$FALLBACK_BACKEND" \
       "$ALLOW_BACKEND_FALLBACK"
     printf 'CUDA_LIBDEVICE=%q\n' "$CUDA_LIBDEVICE"
+    printf 'ROCM_PATH=%q\nROCM_DEVICE_LIB_DIR=%q\nHIP_LIB_DIR=%q\n' \
+      "$ROCM_PATH" "$ROCM_DEVICE_LIB_DIR" "$HIP_LIB_DIR"
   } > "$output"
 }
 
@@ -480,6 +501,12 @@ device_ir = str(data.get("device_ir_kind", first_kernel_value("device_ir_kind", 
 image_kind = str(
     data.get("device_image_kind", first_kernel_value("device_image_kind", "ptx"))
 )
+accelerator_target = str(
+    data.get(
+        "accelerator_target",
+        first_kernel_value("accelerator_target", "cuda"),
+    )
+)
 used_fallback = bool(data.get("used_backend_fallback", False))
 
 for kernel in kernels:
@@ -489,8 +516,11 @@ for kernel in kernels:
         raise SystemExit("fnacc-flang: error: mixed device-IR metadata is unsupported")
     if str(kernel.get("device_image_kind", image_kind)) != image_kind:
         raise SystemExit("fnacc-flang: error: mixed device-image metadata is unsupported")
+    if str(kernel.get("accelerator_target", accelerator_target)) != accelerator_target:
+        raise SystemExit("fnacc-flang: error: mixed accelerator-target metadata is unsupported")
 
-print("\t".join((selected, device_ir, image_kind, "true" if used_fallback else "false")))
+print("\t".join((selected, device_ir, image_kind, accelerator_target,
+                 "true" if used_fallback else "false")))
 PY
 }
 
@@ -641,6 +671,113 @@ if names:
         file=sys.stderr,
     )
     raise SystemExit(1)
+PY
+}
+
+llvm_ir_requires_rocm_device_libs() {
+  local input="$1"
+  grep -Eq '@(__ocml_|__ockl_)' "$input"
+}
+
+resolve_rocm_device_libs() {
+  if [[ -z "$ROCM_DEVICE_LIB_DIR" ]]; then
+    local candidate
+    for candidate in \
+      "$ROCM_PATH/amdgcn/bitcode" \
+      "$ROCM_PATH/lib/llvm/amdgcn/bitcode" \
+      "$ROCM_PATH/lib/bitcode"; do
+      if [[ -f "$candidate/ocml.bc" && -f "$candidate/ockl.bc" ]]; then
+        ROCM_DEVICE_LIB_DIR="$candidate"
+        break
+      fi
+    done
+  fi
+
+  [[ -n "$ROCM_DEVICE_LIB_DIR" && -d "$ROCM_DEVICE_LIB_DIR" ]] ||
+    die "ROCm device libraries were not found; set FNACC_ROCM_DEVICE_LIB_DIR or --fnacc-rocm-device-lib-dir"
+  [[ -f "$ROCM_DEVICE_LIB_DIR/ocml.bc" ]] ||
+    die "ROCm device library is missing: $ROCM_DEVICE_LIB_DIR/ocml.bc"
+  [[ -f "$ROCM_DEVICE_LIB_DIR/ockl.bc" ]] ||
+    die "ROCm device library is missing: $ROCM_DEVICE_LIB_DIR/ockl.bc"
+}
+
+collect_rocm_device_libs() {
+  resolve_rocm_device_libs
+
+  local wave isa candidate
+  if (( THREADS_PER_WARP == 64 )); then
+    wave="oclc_wavefrontsize64_on.bc"
+  else
+    wave="oclc_wavefrontsize64_off.bc"
+  fi
+  isa="oclc_isa_version_${GPU_ARCH#gfx}.amdgcn.bc"
+
+  ROCM_DEVICE_LIBS=(
+    "$ROCM_DEVICE_LIB_DIR/ocml.bc"
+    "$ROCM_DEVICE_LIB_DIR/ockl.bc"
+  )
+  for candidate in \
+    "$ROCM_DEVICE_LIB_DIR/oclc_daz_opt_off.bc" \
+    "$ROCM_DEVICE_LIB_DIR/oclc_unsafe_math_off.bc" \
+    "$ROCM_DEVICE_LIB_DIR/oclc_finite_only_off.bc" \
+    "$ROCM_DEVICE_LIB_DIR/oclc_correctly_rounded_sqrt_on.bc" \
+    "$ROCM_DEVICE_LIB_DIR/$wave" \
+    "$ROCM_DEVICE_LIB_DIR/$isa"; do
+    [[ -f "$candidate" ]] && ROCM_DEVICE_LIBS+=("$candidate")
+  done
+
+  # ROCm releases use versioned ABI control bitcode. Select the newest
+  # installed spelling deterministically.
+  candidate="$(find "$ROCM_DEVICE_LIB_DIR" -maxdepth 1 -type f \
+    -name 'oclc_abi_version_*.bc' -print 2>/dev/null | sort -V | tail -1)"
+  [[ -z "$candidate" ]] || ROCM_DEVICE_LIBS+=("$candidate")
+
+  [[ -f "$ROCM_DEVICE_LIB_DIR/$wave" ]] ||
+    die "ROCm device libraries do not provide $wave"
+  [[ -f "$ROCM_DEVICE_LIB_DIR/$isa" ]] ||
+    die "ROCm device libraries do not support $GPU_ARCH (missing $isa)"
+}
+
+link_rocm_device_libs_if_needed() {
+  local input="$1"
+  local linked_output="$2"
+  local optimized_output="$3"
+  local kernel_name="$4"
+
+  if ! llvm_ir_requires_rocm_device_libs "$input"; then
+    return 1
+  fi
+
+  collect_rocm_device_libs
+  require_exe "$LLVM_LINK"
+  require_exe "$OPT"
+  log "  link ROCm device libraries for $kernel_name"
+  run "$LLVM_LINK" --only-needed "$input" "${ROCM_DEVICE_LIBS[@]}" \
+    -o "$linked_output"
+  test -s "$linked_output" ||
+    die "ROCm-device-library-linked LLVM IR was not generated for $kernel_name"
+
+  run "$OPT" "-passes=default<O3>" "$linked_output" -o "$optimized_output"
+  test -s "$optimized_output" ||
+    die "ROCm-device-library-optimized LLVM IR was not generated for $kernel_name"
+  return 0
+}
+
+validate_hsaco() {
+  local image="$1"
+  local kernel_name="$2"
+  test -s "$image" || die "HSACO was not generated for $kernel_name"
+  # ELF magic is a cheap, toolchain-independent guard against embedding an
+  # assembler diagnostic or textual IR under an .hsaco suffix.
+  python3 - "$image" "$kernel_name" <<'PY'
+import sys
+path, kernel = sys.argv[1:3]
+with open(path, "rb") as f:
+    magic = f.read(4)
+if magic != b"\x7fELF":
+    raise SystemExit(
+        f"fnacc-flang: error: device image for {kernel} is not an ELF HSACO"
+    )
 PY
 }
 
@@ -857,7 +994,7 @@ for idx, k in enumerate(kernels):
         raise RuntimeError(f"unsafe or invalid kernel name: {name!r}")
     if name in seen_names or kernel_id in seen_ids:
         raise RuntimeError(f"duplicate kernel name or id: {name!r}, {kernel_id}")
-    if kernel_id < 0 or num_warps <= 0 or threads_per_warp != 32:
+    if kernel_id < 0 or num_warps <= 0 or threads_per_warp not in (32, 64):
         raise RuntimeError(f"invalid launch metadata for kernel {name}")
     if num_ctas <= 0 or num_stages <= 0:
         raise RuntimeError(f"invalid Triton metadata for kernel {name}")
@@ -880,13 +1017,23 @@ for idx, k in enumerate(kernels):
     out_ttir = out_dir / f"{name}.ttir"
     out_ttir.write_text(module_text, encoding="utf-8")
 
+    image_kind = str(
+        k.get("device_image_kind", data.get("device_image_kind", "ptx"))
+    )
+    extension = {"ptx": ".ptx", "cubin": ".cubin", "hsaco": ".hsaco"}.get(
+        image_kind
+    )
+    if extension is None:
+        raise RuntimeError(f"unsupported device image kind: {image_kind!r}")
+    image_path = out_dir / f"{name}{extension}"
+
     rows.append({
         "index": idx,
         "id": kernel_id,
         "name": name,
         "backend": str(k.get("backend", data.get("selected_backend", "triton"))),
         "device_ir_kind": str(k.get("device_ir_kind", data.get("device_ir_kind", "ttir"))),
-        "device_image_kind": str(k.get("device_image_kind", data.get("device_image_kind", "ptx"))),
+        "device_image_kind": image_kind,
         "num_warps": num_warps,
         "threads_per_warp": threads_per_warp,
         "ttir": str(out_ttir),
@@ -894,7 +1041,9 @@ for idx, k in enumerate(kernels):
         "llvm_mlir": str(out_dir / f"{name}.llvm.mlir"),
         "ll": str(out_dir / f"{name}.ll"),
         "ptx": str(out_dir / f"{name}.ptx"),
-        "image": str(out_dir / f"{name}.ptx"),
+        "object": str(out_dir / f"{name}.amdgpu.o"),
+        "hsaco": str(out_dir / f"{name}.hsaco"),
+        "image": str(image_path),
     })
 
 manifest_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
@@ -1207,16 +1356,21 @@ DISABLE_FNACC=0
 FORCE_RUNTIME=0
 DISABLE_RUNTIME=0
 
+ACCELERATOR_TARGET="${FNACC_TARGET:-cuda}"
+GPU_ARCH="${FNACC_GPU_ARCH:-}"
 SM="${FNACC_SM:-sm_90a}"
 BACKEND="${FNACC_BACKEND:-auto}"
 FALLBACK_BACKEND="${FNACC_FALLBACK_BACKEND:-triton}"
 ALLOW_BACKEND_FALLBACK="${FNACC_ALLOW_BACKEND_FALLBACK:-true}"
 NUM_WARPS="${FNACC_NUM_WARPS:-1}"
-THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-32}"
+THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-}"
 NUM_STAGES="${FNACC_NUM_STAGES:-3}"
 F64_MATMUL_STRATEGY="${FNACC_F64_MATMUL_STRATEGY:-reduce}"
 CUDA_LIB_DIR="${CUDA_LIB_DIR:-}"
 CUDA_LIBDEVICE="${FNACC_CUDA_LIBDEVICE:-}"
+ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+ROCM_DEVICE_LIB_DIR="${FNACC_ROCM_DEVICE_LIB_DIR:-}"
+HIP_LIB_DIR="${FNACC_HIP_LIB_DIR:-}"
 WORKDIR_PARENT="${FNACC_WORKDIR:-}"
 
 KEEP=0
@@ -1258,6 +1412,35 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "$1 requires an argument"
       SM="$2"
       shift 2
+      ;;
+    --fnacc-target)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      ACCELERATOR_TARGET="$2"
+      shift 2
+      ;;
+    --fnacc-target=*)
+      ACCELERATOR_TARGET="${1#*=}"
+      shift
+      ;;
+    --fnacc-gpu-arch)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      GPU_ARCH="$2"
+      shift 2
+      ;;
+    --fnacc-gpu-arch=*)
+      GPU_ARCH="${1#*=}"
+      shift
+      ;;
+    --fnacc-amd-arch)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      ACCELERATOR_TARGET=hip
+      GPU_ARCH="$2"
+      shift 2
+      ;;
+    --fnacc-amd-arch=*)
+      ACCELERATOR_TARGET=hip
+      GPU_ARCH="${1#*=}"
+      shift
       ;;
     --fnacc-backend)
       [[ $# -ge 2 ]] || die "$1 requires an argument"
@@ -1317,6 +1500,33 @@ while [[ $# -gt 0 ]]; do
       ;;
     --fnacc-cuda-libdevice=*|--cuda-libdevice=*)
       CUDA_LIBDEVICE="${1#*=}"
+      shift
+      ;;
+    --fnacc-rocm-path)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      ROCM_PATH="$2"
+      shift 2
+      ;;
+    --fnacc-rocm-path=*)
+      ROCM_PATH="${1#*=}"
+      shift
+      ;;
+    --fnacc-rocm-device-lib-dir)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      ROCM_DEVICE_LIB_DIR="$2"
+      shift 2
+      ;;
+    --fnacc-rocm-device-lib-dir=*)
+      ROCM_DEVICE_LIB_DIR="${1#*=}"
+      shift
+      ;;
+    --fnacc-hip-lib-dir)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      HIP_LIB_DIR="$2"
+      shift 2
+      ;;
+    --fnacc-hip-lib-dir=*)
+      HIP_LIB_DIR="${1#*=}"
       shift
       ;;
     --fnacc-workdir|--workdir)
@@ -1558,7 +1768,7 @@ if [[ "$FNACC_SOURCE_COUNT" == "0" && "$FORCE_RUNTIME" == "0" ]]; then
 fi
 
 case "$STOP_AFTER" in
-  ""|modgen|fir|fnacc-pipeline|ttgir|llvm-mlir|llvm-ir|ptx|embed|host-ll|host-obj|object|objects|link)
+  ""|modgen|fir|fnacc-pipeline|ttgir|llvm-mlir|llvm-ir|ptx|hsaco|device-image|embed|host-ll|host-obj|object|objects|link)
     ;;
   *)
     die "invalid --fnacc-stop-after stage: $STOP_AFTER"
@@ -1577,24 +1787,50 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
   [[ "$FALLBACK_BACKEND" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] ||
     die "invalid FNACC fallback backend name '$FALLBACK_BACKEND'"
 
-  SM="${SM#sm_}"
-  SM="${SM#cc}"
-  [[ "$SM" =~ ^[0-9]+a?$ ]] ||
-    die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, cc80, or sm_90a"
+  case "${ACCELERATOR_TARGET,,}" in
+    cuda|nvidia) ACCELERATOR_TARGET=cuda ;;
+    hip|amd|rocm) ACCELERATOR_TARGET=hip ;;
+    *) die "invalid FNACC target '$ACCELERATOR_TARGET'; expected cuda or hip" ;;
+  esac
+
+  if [[ "$ACCELERATOR_TARGET" == "cuda" ]]; then
+    if [[ -n "$GPU_ARCH" ]]; then
+      SM="$GPU_ARCH"
+    fi
+    SM="${SM#sm_}"
+    SM="${SM#cc}"
+    [[ "$SM" =~ ^[0-9]+a?$ ]] ||
+      die "invalid CUDA SM value '$SM'; expected e.g. 80, sm_80, cc80, or sm_90a"
+    SM_NUM="${SM%a}"
+    SM_SUFFIX="${SM#$SM_NUM}"
+    SM_NUM=$((10#$SM_NUM))
+    SM="${SM_NUM}${SM_SUFFIX}"
+    GPU_ARCH="sm_$SM"
+    TRITON_TARGET="cuda:$SM_NUM"
+    [[ -n "$THREADS_PER_WARP" ]] || THREADS_PER_WARP=32
+  else
+    [[ -n "$GPU_ARCH" ]] || GPU_ARCH="${FNACC_AMD_GPU_ARCH:-gfx90a}"
+    GPU_ARCH="${GPU_ARCH#amd:}"
+    [[ "$GPU_ARCH" =~ ^gfx[0-9a-f]+$ ]] ||
+      die "invalid AMD GPU architecture '$GPU_ARCH'; expected e.g. gfx90a or gfx942"
+    if [[ -z "$THREADS_PER_WARP" ]]; then
+      # CDNA/gfx9 uses wave64; RDNA/gfx10+ uses wave32 by default.
+      if [[ "$GPU_ARCH" =~ ^gfx9 ]]; then
+        THREADS_PER_WARP=64
+      else
+        THREADS_PER_WARP=32
+      fi
+    fi
+    TRITON_TARGET="hip:$GPU_ARCH"
+  fi
+
   [[ "$NUM_WARPS" =~ ^[0-9]+$ ]] || die "invalid num-warps value '$NUM_WARPS'"
   [[ "$THREADS_PER_WARP" =~ ^[0-9]+$ ]] || die "invalid threads-per-warp value '$THREADS_PER_WARP'"
   [[ "$NUM_STAGES" =~ ^[0-9]+$ ]] || die "invalid num-stages value '$NUM_STAGES'"
-  if (( ${#SM} > 3 || ${#NUM_WARPS} > 3 || ${#THREADS_PER_WARP} > 3 || ${#NUM_STAGES} > 2 )); then
+  if (( ${#NUM_WARPS} > 3 || ${#THREADS_PER_WARP} > 3 || ${#NUM_STAGES} > 2 )); then
     die "numeric FNACC launch option is outside the supported range"
   fi
 
-  # Separate the number from the 'a' (if it exists)
-  SM_NUM="${SM%a}"
-  SM_SUFFIX="${SM#$SM_NUM}"
-  
-  # Strip leading zeros and define both variables
-  SM_NUM=$((10#$SM_NUM))         # e.g., 90
-  SM="${SM_NUM}${SM_SUFFIX}"     # e.g., 90a
   NUM_WARPS=$((10#$NUM_WARPS))
   THREADS_PER_WARP=$((10#$THREADS_PER_WARP))
   NUM_STAGES=$((10#$NUM_STAGES))
@@ -1602,7 +1838,13 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
   (( NUM_WARPS > 0 )) || die "num-warps must be positive"
   (( (NUM_WARPS & (NUM_WARPS - 1)) == 0 )) || die "num-warps must be a power of two"
   (( NUM_WARPS <= 32 )) || die "num-warps must not exceed 32"
-  (( THREADS_PER_WARP == 32 )) || die "CUDA lowering currently requires --fnacc-threads-per-warp 32"
+  if [[ "$ACCELERATOR_TARGET" == "cuda" ]]; then
+    (( THREADS_PER_WARP == 32 )) ||
+      die "CUDA lowering requires --fnacc-threads-per-warp 32"
+  else
+    (( THREADS_PER_WARP == 32 || THREADS_PER_WARP == 64 )) ||
+      die "HIP lowering requires --fnacc-threads-per-warp 32 or 64"
+  fi
   (( NUM_STAGES > 0 && NUM_STAGES <= 16 )) || die "num-stages must be between 1 and 16"
   [[ "$HAS_LTO" == "0" ]] || die "LTO is not supported when compiling an FNACC source"
 
@@ -1615,6 +1857,7 @@ if (( FNACC_SOURCE_COUNT > 0 )); then
   LLVM_LINK="${LLVM_LINK:-$LLVM_BUILD/bin/llvm-link}"
   OPT="${OPT:-$LLVM_BUILD/bin/opt}"
   LLC="${LLC:-}"
+  LD_LLD="${LD_LLD:-$ROCM_PATH/llvm/bin/ld.lld}"
 
   require_exe "$FIROPT"
   require_exe "$TCO"
@@ -1626,8 +1869,22 @@ if [[ -n "$CUDA_LIB_DIR" && ! -d "$CUDA_LIB_DIR" ]]; then
 fi
 
 if (( FNACC_SOURCE_COUNT > 0 )) && \
-    [[ -n "$CUDA_LIBDEVICE" && ! -f "$CUDA_LIBDEVICE" ]]; then
+    [[ "$ACCELERATOR_TARGET" == "cuda" && -n "$CUDA_LIBDEVICE" && ! -f "$CUDA_LIBDEVICE" ]]; then
   die "CUDA libdevice bitcode does not exist: $CUDA_LIBDEVICE"
+fi
+
+if (( FNACC_SOURCE_COUNT > 0 )) && [[ "$ACCELERATOR_TARGET" == "hip" ]]; then
+  [[ -d "$ROCM_PATH" ]] || die "ROCm installation does not exist: $ROCM_PATH"
+  if [[ -n "$ROCM_DEVICE_LIB_DIR" && ! -d "$ROCM_DEVICE_LIB_DIR" ]]; then
+    die "ROCm device-library directory does not exist: $ROCM_DEVICE_LIB_DIR"
+  fi
+  if [[ -z "$HIP_LIB_DIR" ]]; then
+    if [[ -d "$ROCM_PATH/lib" ]]; then
+      HIP_LIB_DIR="$ROCM_PATH/lib"
+    elif [[ -d "$ROCM_PATH/lib64" ]]; then
+      HIP_LIB_DIR="$ROCM_PATH/lib64"
+    fi
+  fi
 fi
 
 if [[ -n "$WORKDIR_PARENT" && "$WORKDIR_PARENT" =~ [[:space:]] ]]; then
@@ -1699,9 +1956,10 @@ compile_fnacc_source() {
   local ttir json split_dir manifest embed_c embed_obj
   local effective_num_warps count
   local data_only=0
-  local selected_backend device_ir_kind device_image_kind used_backend_fallback
+  local selected_backend device_ir_kind device_image_kind metadata_target used_backend_fallback
   local ki kernel_name kernel_warps kernel_ttir kernel_ttgir kernel_llvm_mlir
   local kernel_ll kernel_linked_bc kernel_optimized_bc kernel_codegen_ir kernel_ptx
+  local kernel_object kernel_hsaco kernel_image
 
   stem="$(sanitize_stem "$source")"
   source_hash="$(hash_path "$source")"
@@ -1718,7 +1976,7 @@ compile_fnacc_source() {
   embed_obj="$base_path.embedded.o"
 
   log "FNACC compile: $source -> $output"
-  log "  target: sm_$SM, backend=$BACKEND, fallback=$FALLBACK_BACKEND, warps=$NUM_WARPS, threads/warp=$THREADS_PER_WARP, stages=$NUM_STAGES"
+  log "  target: $ACCELERATOR_TARGET:$GPU_ARCH, backend=$BACKEND, fallback=$FALLBACK_BACKEND, warps=$NUM_WARPS, threads/subgroup=$THREADS_PER_WARP, stages=$NUM_STAGES"
 
   log "  [1/10] Generate Fortran module files"
   run "$FLANG" -fsyntax-only "$source" "${COMPILE_FLAGS[@]}"
@@ -1741,6 +1999,7 @@ compile_fnacc_source() {
       threads-per-warp=$THREADS_PER_WARP \
       num-stages=$NUM_STAGES \
       f64-matmul-strategy=$F64_MATMUL_STRATEGY \
+      accelerator-target=$ACCELERATOR_TARGET \
       backend=$BACKEND \
       fallback-backend=$FALLBACK_BACKEND \
       allow-backend-fallback=$ALLOW_BACKEND_FALLBACK" \
@@ -1761,25 +2020,38 @@ compile_fnacc_source() {
       fi
       data_only=1
     else
-      IFS=$'\t' read -r selected_backend device_ir_kind device_image_kind used_backend_fallback \
+      IFS=$'\t' read -r selected_backend device_ir_kind device_image_kind metadata_target used_backend_fallback \
         < <(read_backend_contract "$json")
+      [[ "$metadata_target" == "$ACCELERATOR_TARGET" ]] ||
+        die "compiler emitted target '$metadata_target' while '$ACCELERATOR_TARGET' was requested"
     fi
   else
     if [[ "$BACKEND" == "auto" || "$BACKEND" == "triton" ]]; then
       selected_backend=triton
       device_ir_kind=ttir
-      device_image_kind=ptx
+      if [[ "$ACCELERATOR_TARGET" == "hip" ]]; then
+        device_image_kind=hsaco
+      else
+        device_image_kind=ptx
+      fi
+      metadata_target="$ACCELERATOR_TARGET"
       used_backend_fallback=false
     elif [[ "$ALLOW_BACKEND_FALLBACK" == "true" &&
             "$FALLBACK_BACKEND" == "triton" ]]; then
       selected_backend=triton
       device_ir_kind=ttir
-      device_image_kind=ptx
+      if [[ "$ACCELERATOR_TARGET" == "hip" ]]; then
+        device_image_kind=hsaco
+      else
+        device_image_kind=ptx
+      fi
+      metadata_target="$ACCELERATOR_TARGET"
       used_backend_fallback=true
     else
       selected_backend="$BACKEND"
       device_ir_kind=unknown
       device_image_kind=unknown
+      metadata_target="$ACCELERATOR_TARGET"
       used_backend_fallback=false
     fi
   fi
@@ -1809,8 +2081,11 @@ compile_fnacc_source() {
   log "  selected backend: $selected_backend (device IR=$device_ir_kind, image=$device_image_kind, fallback=$used_backend_fallback)"
 
   case "$selected_backend:$device_ir_kind:$device_image_kind" in
-    triton:ttir:ptx)
+    triton:ttir:ptx|triton:ttir:hsaco)
       require_triton_toolchain
+      if [[ "$device_image_kind" == "hsaco" ]]; then
+        require_exe "$LD_LLD"
+      fi
       ;;
     *)
       die "no driver pipeline is registered for backend '$selected_backend' (device IR '$device_ir_kind', image '$device_image_kind')"
@@ -1826,7 +2101,7 @@ compile_fnacc_source() {
   if [[ "$DRY_RUN" == "1" ]]; then
     quote_cmd python3 "<split-ttir-helper>" "$ttir" "$json" "$split_dir" "$manifest"
     quote_cmd "$TRITON_OPT" "<kernel.ttir>" \
-      "--convert-triton-to-tritongpu=target=cuda:$SM_NUM num-warps=<kernel-warps>" \
+      "--convert-triton-to-tritongpu=target=$TRITON_TARGET num-warps=<kernel-warps>" \
       -o "<kernel.ttgir.mlir>"
     maybe_stop ttgir
     quote_cmd "$TRITON_OPT" "<kernel.ttgir.mlir>" "<configured-lowering-passes>" \
@@ -1834,15 +2109,28 @@ compile_fnacc_source() {
     maybe_stop llvm-mlir
     quote_cmd "$MLIR_TRANSLATE" --mlir-to-llvmir "<kernel.llvm.mlir>" -o "<kernel.ll>"
     maybe_stop llvm-ir
-    log "  link CUDA libdevice only for kernels that reference __nv_* functions"
-    quote_cmd "$LLVM_LINK" --only-needed "<kernel.ll>" \
-      "${CUDA_LIBDEVICE:-<cuda>/nvvm/libdevice/libdevice.10.bc}" \
-      -o "<kernel.libdevice-linked.bc>"
-    quote_cmd "$OPT" "-passes=default<O3>" \
-      "<kernel.libdevice-linked.bc>" -o "<kernel.libdevice-opt.bc>"
-    quote_cmd "$LLC" -march=nvptx64 "-mcpu=sm_$SM" \
-      "<kernel.ll-or-libdevice-opt.bc>" -o "<kernel.ptx>"
-    maybe_stop ptx
+    if [[ "$ACCELERATOR_TARGET" == "cuda" ]]; then
+      log "  link CUDA libdevice only for kernels that reference __nv_* functions"
+      quote_cmd "$LLVM_LINK" --only-needed "<kernel.ll>" \
+        "${CUDA_LIBDEVICE:-<cuda>/nvvm/libdevice/libdevice.10.bc}" \
+        -o "<kernel.libdevice-linked.bc>"
+      quote_cmd "$OPT" "-passes=default<O3>" \
+        "<kernel.libdevice-linked.bc>" -o "<kernel.libdevice-opt.bc>"
+      quote_cmd "$LLC" -march=nvptx64 "-mcpu=sm_$SM" \
+        "<kernel.ll-or-libdevice-opt.bc>" -o "<kernel.ptx>"
+      maybe_stop ptx
+    else
+      log "  link ROCm device libraries only for kernels that reference OCML/OCKL"
+      quote_cmd "$LLVM_LINK" --only-needed "<kernel.ll>" \
+        "${ROCM_DEVICE_LIB_DIR:-<rocm>/amdgcn/bitcode}/{ocml,ockl,oclc_*}.bc" \
+        -o "<kernel.rocm-linked.bc>"
+      quote_cmd "$LLC" -march=amdgcn "-mcpu=$GPU_ARCH" -filetype=obj \
+        "<kernel.ll-or-rocm-opt.bc>" -o "<kernel.amdgpu.o>"
+      quote_cmd "$LD_LLD" -shared --no-undefined "<kernel.amdgpu.o>" \
+        -o "<kernel.hsaco>"
+      maybe_stop hsaco
+    fi
+    maybe_stop device-image
   else
     log "  [4/10] Split TTIR per kernel"
     split_ttir_per_kernel "$ttir" "$json" "$split_dir" "$manifest"
@@ -1855,9 +2143,18 @@ compile_fnacc_source() {
       kernel_warps="$(manifest_get "$manifest" "$ki" num_warps)"
       kernel_ttir="$(manifest_get "$manifest" "$ki" ttir)"
       kernel_ttgir="$(manifest_get "$manifest" "$ki" ttgir)"
-      if [[ -n "${FNACC_TTIR_TO_TTGIR_PASSES:-}" ]]; then
+      if [[ "$ACCELERATOR_TARGET" == "hip" &&
+            -n "${FNACC_HIP_TTIR_TO_TTGIR_PASSES:-}" ]]; then
+        mapfile -t TTIR_TO_TTGIR_PASSES < <(split_pass_pipeline "$FNACC_HIP_TTIR_TO_TTGIR_PASSES")
+        run "$TRITON_OPT" "$kernel_ttir" "${TTIR_TO_TTGIR_PASSES[@]}" -o "$kernel_ttgir"
+      elif [[ -n "${FNACC_TTIR_TO_TTGIR_PASSES:-}" ]]; then
         mapfile -t TTIR_TO_TTGIR_PASSES < <(split_pass_pipeline "$FNACC_TTIR_TO_TTGIR_PASSES")
         run "$TRITON_OPT" "$kernel_ttir" "${TTIR_TO_TTGIR_PASSES[@]}" -o "$kernel_ttgir"
+      elif [[ "$ACCELERATOR_TARGET" == "hip" ]]; then
+        run "$TRITON_OPT" "$kernel_ttir" \
+          "--convert-triton-to-tritongpu=target=$TRITON_TARGET num-warps=$kernel_warps" \
+          "--tritonamdgpu-accelerate-matmul=gfx-arch=$GPU_ARCH" \
+          --canonicalize --cse -o "$kernel_ttgir"
       else
         run "$TRITON_OPT" "$kernel_ttir" \
           "--convert-triton-to-tritongpu=target=cuda:$SM_NUM num-warps=$kernel_warps" \
@@ -1872,9 +2169,31 @@ compile_fnacc_source() {
       kernel_name="$(manifest_get "$manifest" "$ki" name)"
       kernel_ttgir="$(manifest_get "$manifest" "$ki" ttgir)"
       kernel_llvm_mlir="$(manifest_get "$manifest" "$ki" llvm_mlir)"
-      if [[ -n "${FNACC_TTGIR_TO_LLVM_PASSES:-}" ]]; then
+      if [[ "$ACCELERATOR_TARGET" == "hip" &&
+            -n "${FNACC_HIP_TTGIR_TO_LLVM_PASSES:-}" ]]; then
+        mapfile -t TTGIR_TO_LLVM_PASSES < <(split_pass_pipeline "$FNACC_HIP_TTGIR_TO_LLVM_PASSES")
+        run "$TRITON_OPT" "$kernel_ttgir" "${TTGIR_TO_LLVM_PASSES[@]}" -o "$kernel_llvm_mlir"
+      elif [[ -n "${FNACC_TTGIR_TO_LLVM_PASSES:-}" ]]; then
         mapfile -t TTGIR_TO_LLVM_PASSES < <(split_pass_pipeline "$FNACC_TTGIR_TO_LLVM_PASSES")
         run "$TRITON_OPT" "$kernel_ttgir" "${TTGIR_TO_LLVM_PASSES[@]}" -o "$kernel_llvm_mlir"
+      elif [[ "$ACCELERATOR_TARGET" == "hip" ]]; then
+        run "$TRITON_OPT" "$kernel_ttgir" \
+          --tritongpu-coalesce \
+          --tritongpu-remove-layout-conversions \
+          --tritongpu-optimize-thread-locality \
+          --allocate-shared-memory \
+          --convert-scf-to-cf \
+          --canonicalize \
+          --cse \
+          "--convert-triton-amdgpu-to-llvm=arch=$GPU_ARCH" \
+          --convert-index-to-llvm \
+          --convert-arith-to-llvm \
+          --convert-math-to-llvm \
+          --convert-cf-to-llvm \
+          --reconcile-unrealized-casts \
+          --canonicalize \
+          --cse \
+          -o "$kernel_llvm_mlir"
       else
         run "$TRITON_OPT" "$kernel_ttgir" \
           --tritongpu-coalesce \
@@ -1901,7 +2220,9 @@ compile_fnacc_source() {
           -o "$kernel_llvm_mlir"
       fi
       test -s "$kernel_llvm_mlir" || die "kernel LLVM MLIR was not generated for $kernel_name"
-      lower_ttg_warp_id_to_nvvm "$kernel_llvm_mlir"
+      if [[ "$ACCELERATOR_TARGET" == "cuda" ]]; then
+        lower_ttg_warp_id_to_nvvm "$kernel_llvm_mlir"
+      fi
       validate_no_triton_gpu_ops "$kernel_llvm_mlir"
       validate_no_unrealized_casts "$kernel_llvm_mlir"
     done
@@ -1917,26 +2238,55 @@ compile_fnacc_source() {
     done
     maybe_stop llvm-ir
 
-    log "  [8/10] Compile kernels to PTX"
+    if [[ "$ACCELERATOR_TARGET" == "cuda" ]]; then
+      log "  [8/10] Compile kernels to PTX"
+    else
+      log "  [8/10] Compile kernels to HSACO"
+    fi
     for ((ki = 0; ki < count; ++ki)); do
       kernel_name="$(manifest_get "$manifest" "$ki" name)"
       kernel_ll="$(manifest_get "$manifest" "$ki" ll)"
       kernel_ptx="$(manifest_get "$manifest" "$ki" ptx)"
+      kernel_object="$(manifest_get "$manifest" "$ki" object)"
+      kernel_hsaco="$(manifest_get "$manifest" "$ki" hsaco)"
       kernel_codegen_ir="$kernel_ll"
-      kernel_linked_bc="$kernel_ll.libdevice-linked.bc"
-      kernel_optimized_bc="$kernel_ll.libdevice-opt.bc"
-      if link_cuda_libdevice_if_needed \
-          "$kernel_ll" "$kernel_linked_bc" "$kernel_optimized_bc" \
-          "$kernel_name"; then
-        kernel_codegen_ir="$kernel_optimized_bc"
+      if [[ "$ACCELERATOR_TARGET" == "cuda" ]]; then
+        kernel_linked_bc="$kernel_ll.libdevice-linked.bc"
+        kernel_optimized_bc="$kernel_ll.libdevice-opt.bc"
+        if link_cuda_libdevice_if_needed \
+            "$kernel_ll" "$kernel_linked_bc" "$kernel_optimized_bc" \
+            "$kernel_name"; then
+          kernel_codegen_ir="$kernel_optimized_bc"
+        fi
+        run "$LLC" -march=nvptx64 "-mcpu=sm_$SM" \
+          "$kernel_codegen_ir" -o "$kernel_ptx"
+        test -s "$kernel_ptx" || die "PTX was not generated for $kernel_name"
+        validate_no_unresolved_cuda_libdevice_functions "$kernel_ptx" "$kernel_name"
+      else
+        kernel_linked_bc="$kernel_ll.rocm-linked.bc"
+        kernel_optimized_bc="$kernel_ll.rocm-opt.bc"
+        if link_rocm_device_libs_if_needed \
+            "$kernel_ll" "$kernel_linked_bc" "$kernel_optimized_bc" \
+            "$kernel_name"; then
+          kernel_codegen_ir="$kernel_optimized_bc"
+        fi
+        run "$LLC" -mtriple=amdgcn-amd-amdhsa -march=amdgcn \
+          "-mcpu=$GPU_ARCH" -filetype=obj "$kernel_codegen_ir" \
+          -o "$kernel_object"
+        test -s "$kernel_object" ||
+          die "AMDGPU object was not generated for $kernel_name"
+        run "$LD_LLD" -shared --no-undefined "$kernel_object" \
+          -o "$kernel_hsaco"
+        validate_hsaco "$kernel_hsaco" "$kernel_name"
       fi
-      run "$LLC" -march=nvptx64 "-mcpu=sm_$SM" \
-        "$kernel_codegen_ir" -o "$kernel_ptx"
-      test -s "$kernel_ptx" || die "PTX was not generated for $kernel_name"
-      validate_no_unresolved_cuda_libdevice_functions "$kernel_ptx" "$kernel_name"
     done
-    validate_ptx_kernel_abi "$manifest" "$json"
-    maybe_stop ptx
+    if [[ "$ACCELERATOR_TARGET" == "cuda" ]]; then
+      validate_ptx_kernel_abi "$manifest" "$json"
+      maybe_stop ptx
+    else
+      maybe_stop hsaco
+    fi
+    maybe_stop device-image
   fi
 
   log "  [9/10] Embed kernel bundle"
@@ -2036,11 +2386,25 @@ done
 RUNTIME_LINK_FLAGS=()
 if [[ "$NEEDS_FNACC_RUNTIME" == "1" && "$DISABLE_RUNTIME" != "1" && "$RELOCATABLE_LINK" != "1" ]]; then
   [[ -n "${LLVM_BUILD:-}" ]] || die "LLVM_BUILD is required to link the FNACC runtime"
-  RUNTIME_LINK_FLAGS+=("-L$LLVM_BUILD/lib" -lFortranFNACCRuntime)
-  if [[ -n "$CUDA_LIB_DIR" ]]; then
-    RUNTIME_LINK_FLAGS+=("-L$CUDA_LIB_DIR" "-Wl,-rpath,$CUDA_LIB_DIR")
-  fi
-  RUNTIME_LINK_FLAGS+=(-lcuda -lstdc++ "-Wl,-rpath,$LLVM_BUILD/lib")
+  case "${ACCELERATOR_TARGET,,}" in
+    hip|amd|rocm)
+      ACCELERATOR_TARGET=hip
+      RUNTIME_LINK_FLAGS+=("-L$LLVM_BUILD/lib" -lFortranFNACCRuntimeHIP)
+      if [[ -n "$HIP_LIB_DIR" ]]; then
+        RUNTIME_LINK_FLAGS+=("-L$HIP_LIB_DIR" "-Wl,-rpath,$HIP_LIB_DIR")
+      fi
+      RUNTIME_LINK_FLAGS+=(-lamdhip64 -lstdc++ "-Wl,-rpath,$LLVM_BUILD/lib")
+      ;;
+    cuda|nvidia)
+      ACCELERATOR_TARGET=cuda
+      RUNTIME_LINK_FLAGS+=("-L$LLVM_BUILD/lib" -lFortranFNACCRuntime)
+      if [[ -n "$CUDA_LIB_DIR" ]]; then
+        RUNTIME_LINK_FLAGS+=("-L$CUDA_LIB_DIR" "-Wl,-rpath,$CUDA_LIB_DIR")
+      fi
+      RUNTIME_LINK_FLAGS+=(-lcuda -lstdc++ "-Wl,-rpath,$LLVM_BUILD/lib")
+      ;;
+    *) die "invalid FNACC target '$ACCELERATOR_TARGET'; expected cuda or hip" ;;
+  esac
 fi
 
 [[ -n "$OUTPUT" ]] || OUTPUT="a.out"

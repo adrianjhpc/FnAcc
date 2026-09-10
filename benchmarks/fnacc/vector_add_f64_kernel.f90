@@ -20,7 +20,7 @@ contains
   subroutine vector_add_f64_fetch(c)
     real(8) :: c(:)
 
-    !$fnacc exit data copyout(c)
+    !$fnacc update host(c)
   end subroutine
 
   subroutine vector_add_f64_release(a, b, c)

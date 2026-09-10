@@ -337,7 +337,7 @@ if(FNACC_ENABLE_FNACC_BENCHMARKS)
     matrix_add_2d_main.f90)
 
   add_fnacc_benchmark(fnacc-matrix-add-2d-f64
-    matrixadd_2d_f64_kernel.f90
+    matrix_add_2d_f64_kernel.f90
     matrix_add_2d_f64_main.f90)
 
   add_fnacc_benchmark(fnacc-matmul-2d

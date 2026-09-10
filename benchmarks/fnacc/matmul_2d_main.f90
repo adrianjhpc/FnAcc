@@ -17,7 +17,6 @@ program matmul_2d_fnacc
   call parse_i64_arg(2, 512_8, m)
   call parse_i32_arg(3, 20, reps)
 
-  ! Script-compatible choice.
   k = n
 
   allocate(a(n, k), b(k, m), c(n, m))
@@ -41,12 +40,14 @@ program matmul_2d_fnacc
   call matmul_2d_compute(a, b, c)
   call matmul_2d_compute(a, b, c)
 
+  !$fnacc wait
   t0 = wall_time()
 
   do r = 1, reps
     call matmul_2d_compute(a, b, c)
   end do
 
+  !$fnacc wait
   t1 = wall_time()
 
   call matmul_2d_fetch(c)

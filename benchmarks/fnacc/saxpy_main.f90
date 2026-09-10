@@ -34,10 +34,12 @@ program saxpy_fnacc
   y(:) = y0(:)
   call saxpy_prepare(x, y)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call saxpy_compute(alpha, x, y)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   call saxpy_fetch(y)

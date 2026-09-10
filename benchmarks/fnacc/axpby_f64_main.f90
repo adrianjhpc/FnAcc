@@ -31,10 +31,12 @@ program axpby_f64_fnacc
   call axpby_f64_compute(alpha, beta, a, b, c)
   call axpby_f64_compute(alpha, beta, a, b, c)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call axpby_f64_compute(alpha, beta, a, b, c)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   call axpby_f64_fetch(c)

@@ -31,10 +31,12 @@ program matrix_add_2d_fnacc
   call matrix_add_2d_compute(a, b, c)
   call matrix_add_2d_compute(a, b, c)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call matrix_add_2d_compute(a, b, c)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   call matrix_add_2d_fetch(c)

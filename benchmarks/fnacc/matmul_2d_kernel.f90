@@ -4,9 +4,7 @@ contains
   subroutine matmul_2d_prepare(a, b, c)
     real :: a(:, :), b(:, :), c(:, :)
 
-    !$fnacc update device(a)
-    !$fnacc update device(b)
-    !$fnacc update device(c)
+    !$fnacc enter data copyin(a, b) create(c)
   end subroutine
 
   subroutine matmul_2d_compute(a, b, c)
@@ -36,7 +34,7 @@ contains
   subroutine matmul_2d_release(a, b, c)
     real :: a(:, :), b(:, :), c(:, :)
 
-    !$fnacc release(a, b, c)
+    !$fnacc exit data delete(a, b, c)
   end subroutine
 
 end module

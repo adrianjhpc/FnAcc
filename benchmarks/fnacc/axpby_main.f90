@@ -31,10 +31,12 @@ program axpby_fnacc
   call axpby_compute(alpha, beta, a, b, c)
   call axpby_compute(alpha, beta, a, b, c)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call axpby_compute(alpha, beta, a, b, c)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   call axpby_fetch(c)

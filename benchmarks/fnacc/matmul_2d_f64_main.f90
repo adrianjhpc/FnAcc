@@ -40,10 +40,12 @@ program matmul_2d_f64_fnacc
   call matmul_2d_f64_compute(a, b, c)
   call matmul_2d_f64_compute(a, b, c)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call matmul_2d_f64_compute(a, b, c)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   call matmul_2d_f64_fetch(c)

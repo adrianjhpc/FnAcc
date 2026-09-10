@@ -29,10 +29,12 @@ program reduction_dot_f64_fnacc
   call reduction_dot_f64_compute(a, b, result)
   call reduction_dot_f64_compute(a, b, result)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call reduction_dot_f64_compute(a, b, result)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   expected = 0.0_8

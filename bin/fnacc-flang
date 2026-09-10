@@ -45,6 +45,7 @@ FNACC options:
   --fnacc-backend-fallback Enable backend fallback (the default)
   --fnacc-no-backend-fallback
                            Fail instead of using the fallback backend
+  --fnacc-launch-abi N     Host launch ABI: 2 or 3 (default).
   --fnacc-num-warps N      Triton warps; default FNACC_NUM_WARPS or 1.
                            Multi-warp reduction lowering is automatic.
   --fnacc-threads-per-warp N
@@ -92,6 +93,7 @@ Environment:
   CUDA_LIB_DIR             Optional CUDA driver library directory
 
 Optional environment:
+  FNACC_LAUNCH_ABI         host launch ABI, defaults to 3
   FNACC_NUM_WARPS          number of warps to use, defaults to 1
   FNACC_THREADS_PER_WARP   threads per warp, defaults to 32
   FNACC_NUM_STAGES         number of Triton pipeline stages, defaults to 3
@@ -404,6 +406,7 @@ write_toolchain_manifest() {
     printf 'ACCELERATOR_TARGET=%s\nGPU_ARCH=%s\nSM=%s\nNUM_WARPS=%s\nTHREADS_PER_WARP=%s\nNUM_STAGES=%s\n' \
       "$ACCELERATOR_TARGET" "$GPU_ARCH" "$SM" "$NUM_WARPS" \
       "$THREADS_PER_WARP" "$NUM_STAGES"
+    printf 'LAUNCH_ABI=%s\n' "$LAUNCH_ABI"
     printf 'BACKEND_REQUESTED=%s\nBACKEND_FALLBACK=%s\nALLOW_BACKEND_FALLBACK=%s\n' \
       "$BACKEND" "$FALLBACK_BACKEND" \
       "$ALLOW_BACKEND_FALLBACK"
@@ -421,7 +424,7 @@ validate_json() {
 validate_kernel_json() {
   local json_file="$1"
 
-  python3 - "$json_file" <<'PY'
+  python3 - "$json_file" "$ACCELERATOR_TARGET" "${SM_NUM:-0}" <<'PY'
 import json
 import sys
 
@@ -445,6 +448,14 @@ if not isinstance(kernels, list):
     raise SystemExit(1)
 
 for kernel in kernels:
+    precision = kernel.get("matmul_precision", "ieee")
+    if precision not in ("ieee", "tf32", "tf32x3"):
+        raise SystemExit("fnacc-flang: error: invalid matmul_precision metadata")
+    if precision != "ieee":
+        if sys.argv[2] != "cuda" or int(sys.argv[3]) < 80:
+            raise SystemExit(
+                f"fnacc-flang: error: matmul_precision({precision}) requires CUDA SM80 or newer"
+            )
     if not isinstance(kernel.get("params"), list):
         print("fnacc-flang: error: kernel JSON has no parameter list", file=sys.stderr)
         raise SystemExit(1)
@@ -522,6 +533,22 @@ for kernel in kernels:
 print("\t".join((selected, device_ir, image_kind, accelerator_target,
                  "true" if used_fallback else "false")))
 PY
+}
+
+
+kernel_matmul_precision() {
+  python3 - "$1" "$2" <<'PYCODE'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    kernels = json.load(stream)["kernels"]
+for kernel in kernels:
+    if kernel["name"] == sys.argv[2]:
+        print(kernel.get("matmul_precision", "ieee"))
+        break
+else:
+    raise SystemExit("fnacc-flang: error: missing kernel precision metadata")
+PYCODE
 }
 
 require_triton_toolchain() {
@@ -1362,6 +1389,7 @@ SM="${FNACC_SM:-sm_90a}"
 BACKEND="${FNACC_BACKEND:-auto}"
 FALLBACK_BACKEND="${FNACC_FALLBACK_BACKEND:-triton}"
 ALLOW_BACKEND_FALLBACK="${FNACC_ALLOW_BACKEND_FALLBACK:-true}"
+LAUNCH_ABI="${FNACC_LAUNCH_ABI:-3}"
 NUM_WARPS="${FNACC_NUM_WARPS:-1}"
 THREADS_PER_WARP="${FNACC_THREADS_PER_WARP:-}"
 NUM_STAGES="${FNACC_NUM_STAGES:-3}"
@@ -1467,6 +1495,11 @@ while [[ $# -gt 0 ]]; do
     --fnacc-no-backend-fallback)
       ALLOW_BACKEND_FALLBACK=false
       shift
+      ;;
+    --fnacc-launch-abi)
+      [[ $# -ge 2 ]] || die "$1 requires an argument"
+      LAUNCH_ABI="$2"
+      shift 2
       ;;
     --fnacc-num-warps|--num-warps)
       [[ $# -ge 2 ]] || die "$1 requires an argument"
@@ -1775,6 +1808,11 @@ case "$STOP_AFTER" in
     ;;
 esac
 
+case "$LAUNCH_ABI" in
+  2|3) ;;
+  *) die "invalid FNACC launch ABI '$LAUNCH_ABI'; expected 2 or 3" ;;
+esac
+
 case "$F64_MATMUL_STRATEGY" in
   reduce|fma|dot) ;;
   *) die "invalid FNACC F64 matmul strategy '$F64_MATMUL_STRATEGY'; expected reduce, fma, or dot" ;;
@@ -1976,6 +2014,7 @@ compile_fnacc_source() {
   embed_obj="$base_path.embedded.o"
 
   log "FNACC compile: $source -> $output"
+  log "  host launch ABI: $LAUNCH_ABI"
   log "  target: $ACCELERATOR_TARGET:$GPU_ARCH, backend=$BACKEND, fallback=$FALLBACK_BACKEND, warps=$NUM_WARPS, threads/subgroup=$THREADS_PER_WARP, stages=$NUM_STAGES"
 
   log "  [1/10] Generate Fortran module files"
@@ -1995,6 +2034,7 @@ compile_fnacc_source() {
   run env "FNACC_KERNEL_BUNDLE_KEY=$source_hash" "$FIROPT" \
     "--fnacc-pipeline=ttir-output=$ttir json-output=$json \
       emit-fortran-aliases=true \
+      launch-abi=$LAUNCH_ABI \
       num-warps=$NUM_WARPS \
       threads-per-warp=$THREADS_PER_WARP \
       num-stages=$NUM_STAGES \
@@ -2156,8 +2196,14 @@ compile_fnacc_source() {
           "--tritonamdgpu-accelerate-matmul=gfx-arch=$GPU_ARCH" \
           --canonicalize --cse -o "$kernel_ttgir"
       else
+        local -a matmul_precision_passes=()
+        if [[ "$(kernel_matmul_precision "$json" "$kernel_name")" == "tf32x3" ]]; then
+          # Expand compensated FP32 dots before selecting tensor-core layouts.
+          matmul_precision_passes+=(--tritongpu-coalesce --tritongpu-F32DotTC)
+        fi
         run "$TRITON_OPT" "$kernel_ttir" \
           "--convert-triton-to-tritongpu=target=cuda:$SM_NUM num-warps=$kernel_warps" \
+          "${matmul_precision_passes[@]}" \
           --tritongpu-accelerate-matmul --canonicalize --cse -o "$kernel_ttgir"
       fi
       test -s "$kernel_ttgir" || die "TTGIR was not generated for $kernel_name"

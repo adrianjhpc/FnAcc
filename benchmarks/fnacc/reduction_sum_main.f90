@@ -28,10 +28,12 @@ program reduction_sum_fnacc
   call reduction_sum_compute(a, result)
   call reduction_sum_compute(a, result)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call reduction_sum_compute(a, result)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   expected = 0.0d0

@@ -34,10 +34,12 @@ program daxpy_fnacc
   y(:) = y0(:)
   call daxpy_prepare(x, y)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call daxpy_compute(alpha, x, y)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   call daxpy_fetch(y)

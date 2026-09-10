@@ -28,10 +28,12 @@ program vector_add_fnacc
   call vector_add_compute(a, b, c)
   call vector_add_compute(a, b, c)
 
+  !$fnacc wait
   t0 = wall_time()
   do r = 1, reps
     call vector_add_compute(a, b, c)
   end do
+  !$fnacc wait
   t1 = wall_time()
 
   call vector_add_fetch(c)

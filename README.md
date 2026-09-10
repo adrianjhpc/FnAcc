@@ -5,7 +5,7 @@ Fortran loop kernels to GPUs and other accelerators. Its source model is
 deliberately similar to OpenACC and OpenMP offload, while its compiler path is
 built directly into LLVM Flang.
 
-The current production backend uses [Triton](https://triton-lang.org/) to
+The implemented backend uses [Triton](https://triton-lang.org/) to
 generate code for NVIDIA GPUs through CUDA and AMD GPUs through HIP/ROCm.
 Kernel recognition, launch planning, metadata, and the host runtime interface
 are backend-neutral so that other code-generation backends and accelerator
@@ -39,6 +39,7 @@ The compiler driver lives in a separate repository.
 - [Runtime configuration](#runtime-configuration)
 - [Compiler and runtime architecture](#compiler-and-runtime-architecture)
 - [Backend artifact contract](#backend-artifact-contract)
+- [Performance tuning and profiling](#performance-tuning-and-profiling)
 - [Testing](#testing)
 - [Extending FnACC](#extending-fnacc)
 - [Diagnostics and troubleshooting](#diagnostics-and-troubleshooting)
@@ -51,7 +52,8 @@ FnACC currently provides:
 - `parallel` lowering for recognised one- and two-dimensional Fortran loops;
 - arbitrary runtime loop lower and upper bounds for elementwise, stencil, and
   reduction kernels, with a unit loop step;
-- variadic array and scalar bindings through the version 2 launch ABI;
+- descriptor-based host launches through ABI v3 by default, with explicit v2
+  compatibility and variadic array/scalar bindings;
 - one or more output assignments in a recognised loop;
 - `real(4)`, `real(8)`, and signed `integer(1|2|4|8)` device expressions;
 - affine induction-variable expressions, including the common
@@ -71,7 +73,9 @@ FnACC currently provides:
 - derived-component data designators such as
   `chunk%tiles(1)%field%density0`;
 - `no_copyback` launch behavior for device-resident outputs;
+- opt-in asynchronous resident launches with `FNACC_ASYNC_RESIDENT=1`;
 - explicit synchronization with `!$fnacc wait`;
+- IEEE-default FP32 matmul and explicit `matmul_precision(tf32|tf32x3)`;
 - explicit-shape, assumed-shape, pointer/heap-backed, and allocatable arrays
   when their storage is contiguous;
 - multiple separately compiled embedded FnACC bundles in one executable;
@@ -166,7 +170,8 @@ export LD_LLD="$ROCM_PATH/llvm/bin/ld.lld"
 Configure one or both runtime targets:
 
 ```sh
-cmake -S llvm -B build \
+cmake -S llvm -B build -G Ninja \
+  -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
   -DFLANG_FNACC_RUNTIME=ON \
   -DFLANG_FNACC_RUNTIME_BACKEND=BOTH
 ```
@@ -188,7 +193,27 @@ cmake --build "$LLVM_BUILD" \
 ```
 
 When only one target was configured, omit the other runtime target from the
-build command.
+build command. These are configuration fragments: preserve the target,
+assertion, compiler, and dependency settings of your working LLVM/Triton build.
+With an existing Ninja build, the equivalent rebuild is:
+
+```sh
+ninja -C "$LLVM_BUILD" fir-opt flang FortranFNACCRuntime
+```
+
+After changing device lowering, recompile the affected Fortran source objects
+and relink the application. Relinking alone does not regenerate embedded GPU
+code. Changing the default host launch ABI also requires recompiling the host
+launch sites. Rebuild and relink the matching runtime when its implementation
+changes.
+
+NVTX instrumentation is optional and disabled by default in the revised runtime.
+A normal runtime build does not require `nvtx3/nvtx3.hpp`. For an instrumented
+build, define `FNACC_ENABLE_NVTX=1` on the runtime CMake target, add the directory
+containing `nvtx3/` to its include paths, and link `${CMAKE_DL_LIBS}` where needed.
+Set include paths in CMake and regenerate the Ninja build; do not edit generated
+`build.ninja` rules. Runtime targets also require the platform thread dependency
+(for example, CMake `Threads::Threads`).
 
 ## Quick start
 
@@ -312,6 +337,12 @@ lower bounds must currently be the constant `1`.
 program in each dimension. It is not the CUDA thread-block size or HIP workgroup
 size.
 
+The requested warp count is preserved by the updated scheduling analysis rather
+than unconditionally reducing ordinary kernels to one effective warp. The default
+request remains one warp unless overridden; eight warps is a tuning choice, not
+a new global default. Check the driver's `effective warps` message and generated
+JSON after rebuilding.
+
 The hardware block size comes from the selected schedule:
 
 ```text
@@ -347,7 +378,7 @@ pipeline.
 ### `parallel`
 
 ```fortran
-!$fnacc parallel [tile(...)] [pack(...)] [reduction(...)] [no_copyback]
+!$fnacc parallel [tile(...)] [pack(...)] [reduction(...)] [matmul_precision(...)] [no_copyback]
 do ...
   ...
 end do
@@ -362,6 +393,7 @@ end do
 | `reduction(*:s)` | Multiplicative reduction into `s`. |
 | `reduction(min:s)` | Minimum reduction into `s`. |
 | `reduction(max:s)` | Maximum reduction into `s`. |
+| `matmul_precision(ieee\|tf32\|tf32x3)` | FP32 matmul input precision; default `ieee`. Explicit reduced-precision modes require a supported CUDA target. |
 | `no_copyback` | Do not automatically copy arrays written by this launch back to the host. Keep their results in cached device storage. |
 
 `pack` currently names simple variables, not arbitrary designators or array
@@ -466,7 +498,7 @@ later device work:
 !$fnacc parallel tile(16,16) no_copyback
 do k = y_min, y_max
   do j = x_min, x_max
-    pressure(j,k) = equation_of_state(j,k)
+    pressure(j,k) = (1.4_8 - 1.0_8) * density(j,k) * energy(j,k)
   end do
 end do
 ```
@@ -586,7 +618,8 @@ do i = lower, upper
 end do
 ```
 
-The version 2 launch ABI is variadic. It is not restricted to the older
+Both the v3 host descriptor and the retained v2 binding interface support
+variadic arguments. They are not restricted to the older
 three-input/three-scalar shape. Practical limits instead come from the
 recogniser, generated kernel signature, and backend.
 
@@ -658,6 +691,28 @@ end do
 
 `real(4)` and `real(8)` matrices are supported. The lower bounds of all three
 loops must currently be `1`.
+
+FP32 matmul uses `ieee` input precision by default. Masked matmul inputs are
+zero-padded so partial tiles do not contribute undefined values. To opt into
+reduced-precision tensor-core input arithmetic on supported NVIDIA GPUs:
+
+```fortran
+!$fnacc parallel tile(64,64,32) matmul_precision(tf32)
+```
+
+| Mode | Behavior |
+| --- | --- |
+| `ieee` | Default FP32 input precision; no opt-in to TF32 input rounding. |
+| `tf32` | Explicit reduced-precision input arithmetic. |
+| `tf32x3` | Three-product TF32 decomposition for improved accuracy over TF32; not a guarantee of bitwise IEEE equivalence. |
+
+The clause applies to one recognised FP32 matmul launch. It is rejected on
+FP64 matmul, elementwise kernels, and reductions. The implemented HIP backend
+rejects TF32 modes. The CUDA driver requires SM80 or newer for TF32 modes;
+TF32x3 also requires the corresponding Triton decomposition pass. Custom
+TTIR-to-TTGIR pipelines must retain the required decomposition before matmul
+acceleration. Validate numerical error for the application's inputs and
+acceptance criteria; do not change validation tolerances merely to hide errors.
 
 Select the f64 code-generation strategy with:
 
@@ -819,13 +874,21 @@ FNACC_REDUCTION_STATS=1 ./program
 ```
 
 prints allocation, growth, reuse, capacity, primary-launch, and stage-launch
-counters at process exit. `FNACC_DEBUG=1` prints individual stages.
+counters at process exit. These workspace counters cover the original partial
+and scratch buffers, not every auxiliary result allocation. `FNACC_DEBUG=1` prints individual stages.
+
+The revised multi-result finalization path enqueues the final reduction stages
+and preserves each result in a packed device buffer. The device-stage path uses
+one final explicit wait and one host transfer for the combined results rather
+than waiting and transferring separately for every result. Original host seeds
+still participate in each reduction. Host-returned scalar reductions remain
+synchronous even when asynchronous resident array launches are enabled.
 
 ## Types, ranks, and storage
 
 | Feature | Supported today |
 | --- | --- |
-| Device expression elements | `real(4)`, `real(8)`, signed `integer(1|2|4|8)` |
+| Device expression elements | `real(4)`, `real(8)`, signed `integer(1\|2\|4\|8)` |
 | Elementwise/stencil kernel rank | 1 or 2 |
 | Matrix multiplication rank | 2 |
 | Reduction rank | 1, plus recognised fused rank-2 reductions |
@@ -936,6 +999,7 @@ Flags are routed to the relevant frontend, host-codegen, or final-link stage.
 | `--fnacc-disable` | Delegate every source to Flang. |
 | `--fnacc-runtime` | Force FnACC runtime libraries into the final link. |
 | `--fnacc-no-runtime` | Do not add the runtime automatically. |
+| `--fnacc-launch-abi N` | Host launch ABI: `3` by default, or explicit `2` compatibility. |
 | `--fnacc-target NAME` | Accelerator platform: `cuda` (default) or `hip`. The spellings `nvidia`, `amd`, and `rocm` are normalized. |
 | `--fnacc-gpu-arch ARCH` | Target architecture such as `sm_90a`, `gfx90a`, or `gfx942`. |
 | `--fnacc-sm N` | CUDA compatibility option accepting `80`, `sm_80`, `cc80`, or `sm_90a`. |
@@ -989,6 +1053,7 @@ fnacc-flang --fnacc-verbose --fnacc-keep \
 | `ROCM_PATH` | ROCm installation prefix; default `/opt/rocm`. |
 | `FNACC_ROCM_DEVICE_LIB_DIR` | ROCm bitcode directory containing OCML/OCKL and control bitcode. |
 | `FNACC_HIP_LIB_DIR` | Directory containing `libamdhip64`; defaults to `$ROCM_PATH/lib` or `lib64`. |
+| `FNACC_LAUNCH_ABI` | Default host launch ABI; `3`. An explicit `--fnacc-launch-abi` overrides it. |
 | `FNACC_TARGET` | Default accelerator target: `cuda` or `hip`. |
 | `FNACC_GPU_ARCH` | Default target architecture such as `sm_90a` or `gfx942`. |
 | `FNACC_SM` | CUDA architecture compatibility variable. |
@@ -1019,11 +1084,48 @@ intermediate paths.
 | `FNACC_CUDA_DEVICE` | CUDA device ordinal when `FNACC_DEVICE` is unset. |
 | `FNACC_HIP_DEVICE` | HIP device ordinal when `FNACC_DEVICE` is unset. |
 | `FNACC_USE_CURRENT_CONTEXT` | Use the caller's current CUDA or HIP context instead of retaining a primary context. |
+| `FNACC_ASYNC_RESIDENT` | Set to `1` to enqueue eligible cached-array launches without waiting after each launch; unset/default retains synchronous completion. |
 | `FNACC_DEBUG` | Print initialization, bundle, cache, data-region, launch, grid, tile, ABI, and reduction diagnostics. |
 | `FNACC_REDUCTION_STATS` | Print aggregate reduction-workspace counters at exit. |
 | `FNACC_MATMUL_SHARED_BYTES` | Advanced f32 matmul dynamic-shared-memory override; cannot be below the computed safe minimum. |
 | `FNACC_MATMUL_F64_SHARED_BYTES` | Advanced f64 matmul dynamic-shared-memory override; cannot be below the computed safe minimum. |
 | `FNACC_PTX_DIR`, `FNACC_PTX`, `FNACC_KERNELS_JSON` | Legacy CUDA external-bundle debugging fallbacks. Driver-built objects normally use embedded images and JSON. |
+
+### Asynchronous resident execution
+
+```sh
+FNACC_ASYNC_RESIDENT=1 FNACC_DEVICE=0 ./program
+```
+
+This is independent of the host launch ABI: selecting v3 does not enable async
+execution. Only eligible array launches whose allocations remain cached may
+return before device completion. Temporary/host-output paths and reductions
+returning host scalars retain synchronization. Host transfers and allocation
+lifetime operations order against queued work on the FnACC stream.
+
+Use explicit waits around a timed sequence:
+
+```fortran
+! Warm up before measuring.
+call compute()
+!$fnacc wait
+
+t0 = wall_time()
+do r = 1, reps
+  call compute()
+end do
+!$fnacc wait
+t1 = wall_time()
+
+! Fetch results outside the timed interval if measuring resident compute.
+!$fnacc update host(c)
+```
+
+Without the second wait, the timer may measure submission rather than completed
+GPU work. Without the first, warm-up work may leak into the timed interval.
+An eventual successful validation does not prove that the timed interval
+included device execution. State whether transfers are included in any reported
+performance measurement.
 
 ### Accelerator context behavior
 
@@ -1044,11 +1146,18 @@ another context or accelerator runtime.
 
 ### Thread safety
 
-Public runtime entry points and shared caches are protected by a process-wide
-recursive mutex. Calls from multiple host threads are safe with respect to
-runtime maps and CUDA/HIP resource lifetimes, but host-side runtime entry is
-currently serialized. This is correctness-oriented thread safety, not
-concurrent multi-stream execution.
+The revised runtime uses thread-local active-context/operation state, a short
+registry lock, per-context mutexes, and a shared lifetime guard. Operations on
+one context remain serialized; operations on separate initialized contexts can
+proceed independently. Cold initialization and cleanup require broader locking.
+Callers must still coordinate shared data-region lifetimes and their own host
+accesses. This does not introduce multiple user queues within a context.
+
+Debug, async-resident, and reduction-stat flags are sampled once per outer
+runtime operation. Immutable kernel metadata and resolved descriptors are reused
+to reduce repeated parsing and lookup; live argument values, layouts, and
+ownership remain validated. Device/context selection is not permanently cached
+across calls.
 
 ## Compiler and runtime architecture
 
@@ -1106,19 +1215,59 @@ loop/terminator machinery. When adding a pattern, update consumed-operation
 accounting with the recogniser. Otherwise a valid pattern may be rejected—or
 an effect could be erased without being represented in device code.
 
-### Version 2 launch ABI
+### Host launch ABI v3 (default)
 
-The variadic launch interface is built in stages:
+The compiler constructs a host request containing launch dimensions, array
+records, scalar/index captures, and reduction-result records, then emits:
 
-1. `__fnacc_begin_launch_v2` creates a pending launch;
-2. array descriptors, scalar values, index captures, and reduction results are
-   bound with typed `__fnacc_bind_*_v2` calls; and
-3. `__fnacc_commit_launch_v2` validates metadata and launches the kernel.
+```text
+__fnacc_launch_v3(request_pointer)
+```
 
-The stable public ABI includes array pointers and layout metadata, scalar and
-index values, loop extents and lower bounds, and reduction outputs. Backend
-private arguments are excluded. The Triton target lowering records its private
-pointer count separately in metadata for both CUDA and HIP images.
+This replaces the generated sequence of begin/bind/commit calls. Scalar values
+and reduction seeds are captured for the invocation. The runtime consumes the
+request during the call; async mode does not make stack request storage into a
+device-owned object. Cached device allocations follow the normal lifetime rules.
+The v3 entry reuses the checked launch machinery under one outer operation and
+context guard; it does not change the numerical device kernel.
+
+```sh
+# Default v3; an environment override can change this.
+fnacc-flang -O3 -c kernel.f90
+
+# Explicit selection overrides FNACC_LAUNCH_ABI.
+fnacc-flang --fnacc-launch-abi 3 -O3 -c kernel.f90
+fnacc-flang --fnacc-launch-abi 2 -O3 -c kernel.f90
+```
+
+Both `fnacc-pipeline` and standalone `fnacc-lower-to-runtime` default to v3:
+
+```sh
+fir-opt --fnacc-pipeline="launch-abi=2 ttir-output=k.ttir json-output=k.json" input.fir
+fir-opt --fnacc-lower-to-runtime="launch-abi=2" input.fir
+```
+
+V3 lowering requires an explicit supported 64-bit `x86_64` or `aarch64` host
+`llvm.target_triple`. Missing triples, x32/ILP32 forms, and other host targets
+are rejected by the current implementation. Use v2 for unsupported host targets;
+hand-written MLIR intended to test v3 must declare its actual supported target.
+
+### V2 compatibility and device metadata
+
+V2 remains available through `__fnacc_begin_launch_v2`, typed
+`__fnacc_bind_*_v2` calls, and `__fnacc_commit_launch_v2`. Keep these runtime
+symbols and their compatibility tests.
+
+**The host launch selection and JSON device launch ABI are different contracts.**
+The v3 integration retains device JSON `launch_abi_version = 2`, device signatures,
+and backend-private argument accounting. Do not rename JSON fields, change their
+version to 3, or change runtime device-ABI checks just because v3 is the host
+default. No new device precision mode is implied by v3.
+
+Maintain the default consistently in the driver, `FNACCPipelines.cpp`, and
+`FNACCPasses.td`. Rebuild generated pass declarations through the normal build;
+do not edit generated files. The driver logs the selected host ABI and includes
+it in its toolchain fingerprint.
 
 ## Backend artifact contract
 
@@ -1152,7 +1301,7 @@ descriptor records:
 - image index and file;
 - kernel kind and rank;
 - logical tile, warp/stage schedule, subgroup width, and threads per CTA;
-- launch ABI version;
+- device launch ABI version (still `2` with the v3 host launcher);
 - array, scalar, output, and reduction-result counts;
 - parameter roles, slots, names, types, array dimensions, and layout fields;
 - loop lower-bound and extent roles;
@@ -1178,6 +1327,142 @@ must still produce an image supported by the selected runtime.
 Adding a compiler backend enum alone is insufficient. Driver dispatch,
 manifest/embed logic, runtime loading, contract validation, and tests must be
 updated together.
+
+## Performance tuning and profiling
+
+### Preserve residency across application phases
+
+For an iterative application, establish one intended data lifetime across setup
+and the timestep loop. Fetch only the fields needed by host consumers and release
+storage after its final use. Closing a region at the end of initialization and
+opening another at the start of hydro can introduce a large copyout/re-upload.
+One MPI process removes inter-process communication, but physical-boundary halo
+updates and any application-level tile exchanges may still run.
+
+### Tune individual kernels
+
+Tile shape and warp count are separate parameters. The first Fortran dimension
+is contiguous, so wider tiles in that dimension are useful candidates. The
+emitted TTGIR layout, array strides, masks, and final device code determine the
+actual memory behavior. More warps are not automatically better.
+
+For the measured H100 CloverLeaf long case, the confirmed configuration for
+`ideal_gas_kernel.f90`, `reset_field_kernel.f90` (both loops), and
+`revert_kernel.f90` is:
+
+```fortran
+!$fnacc parallel tile(256,1) no_copyback
+```
+
+with `--fnacc-num-warps 8 --fnacc-threads-per-warp 32`. Keep the original ideal-gas
+arithmetic. This is an application-specific tuning result, not a replacement for
+all stencil or reduction tiles. Earlier interior `64,4` and halo-strip changes
+remain separate choices for other kernels. Halo strips should place the long
+dimension along the boundary traversal and the short dimension along halo depth;
+preserve each loop's bounds and corner dependencies when changing them.
+
+The paired long-run profiles showed the following accumulated device durations:
+
+| Kernel family | Previous FnACC | Tuned FnACC (`256,1`, 8 warps) | Matching earlier CUDA capture | Matching earlier OpenACC capture |
+| --- | ---: | ---: | ---: | ---: |
+| Ideal gas | 9.279 s | 7.845 s | 7.966 s | 8.827 s |
+| Reset, both loops | 8.529 s | 7.427 s | 7.412 s | 7.487 s |
+| Revert | 4.437 s | 3.749 s | 3.664 s | 3.792 s |
+| All GPU kernels | 193.675 s | 190.446 s | 200.252 s | 198.255 s |
+
+These are sums of kernel durations from particular captures, not application
+wall times or a portable speedup claim. The tuned routines account for about
+3.224 seconds of the 3.229-second change; other kernels were essentially
+unchanged. Full input files, build revisions, clocks, and run conditions are
+needed to reproduce a comparison. Validate each configuration and compare repeated
+unprofiled runs before accepting small differences.
+
+V3 reduced some host overhead in the microbenchmarks but did not measurably
+change CloverLeaf wall time or reported correctness. Do not attribute device
+kernel improvements from tile tuning to the host ABI change. Large kernels can
+hide host submission savings; small resident kernels are more sensitive to them.
+
+### Inspect generated kernels
+
+Keep intermediates for the exact source/configuration being measured:
+
+```sh
+mkdir -p fnacc-inspect
+fnacc-flang --fnacc-target cuda --fnacc-gpu-arch sm_90a \
+  --fnacc-num-warps 8 --fnacc-threads-per-warp 32 \
+  --fnacc-keep --fnacc-workdir "$PWD/fnacc-inspect" \
+  -O3 -c reset_field_kernel.f90 -o reset_field_kernel.o
+
+rg --files fnacc-inspect | rg '\.ptx$'
+rg -n --glob '*.ptx' '\.entry' fnacc-inspect
+rg -n --glob '*.json' '"tile"|"num_warps"|"threads_per_cta"' fnacc-inspect
+```
+
+Retain normal application include/module flags and relink before measuring.
+The normal driver log does not list every kernel name. Generated `.kernels.json`
+and per-kernel filenames map source bundles to names; `.entry` identifies PTX
+entry points. Do not assume an old numeric kernel name identifies a new build.
+
+Inspect `.ttgir.mlir` for `sizePerThread`, `threadsPerWarp`, and `warpsPerCTA`;
+inspect PTX for address calculation, predicated memory operations, and arithmetic.
+Scalar 64-bit loads/stores are not inherently uncoalesced. PTX register names
+are virtual registers and cannot establish final physical register usage,
+spilling, or achieved occupancy.
+
+### Nsight Systems summaries
+
+For CUDA tracing, use the application's normal single-process invocation and
+working directory, with a unique report name:
+
+```sh
+FNACC_ASYNC_RESIDENT=1 nsys profile \
+  --trace=cuda,nvtx --sample=none \
+  -o cloverleaf-fnacc ./clover_leaf
+
+nsys stats \
+  --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum,cuda_gpu_mem_size_sum \
+  cloverleaf-fnacc.nsys-rep > cloverleaf-fnacc-summary.txt
+```
+
+NVTX ranges appear only if instrumentation is enabled; CUDA tracing does not
+require application NVTX instrumentation. Nsight Systems can also generate these
+summaries from its SQLite export. Retain the full trace when investigating
+ordering or gaps: aggregate summaries do not locate copies within application
+phases or establish overlap.
+
+Compare matching mesh dimensions, step counts, summary frequency, and validation
+results. Compare kernel families as well as individual kernels because one
+implementation may split work into more launches. Time inside
+`cuEventSynchronize`, stream waits, or synchronous copies includes waiting for
+GPU work; do not add it to GPU kernel time as independent overhead.
+
+### Nsight Compute and restricted profiling environments
+
+When GPU counter access is available, collect a few invocations of one kernel:
+
+```sh
+# Replace ENTRY_NAME with the exact entry from the current generated PTX.
+FNACC_ASYNC_RESIDENT=1 ncu \
+  --kernel-name-base function --kernel-name ENTRY_NAME \
+  --launch-skip 10 --launch-count 3 --kill yes \
+  --section LaunchStats --section Occupancy \
+  --section SpeedOfLight --section MemoryWorkloadAnalysis \
+  --export kernel-profile ./clover_leaf
+
+ncu --import kernel-profile.ncu-rep --page details > kernel-profile.txt
+ncu --import kernel-profile.ncu-rep --page raw --csv > kernel-profile.csv
+```
+
+Skip/count apply to matching kernel launches, not all application launches.
+Counter collection may replay each invocation. `--kill yes` stops the diagnostic
+run after collection, so run numerical validation separately to completion.
+
+If `ERR_NVGPUCTRPERM` appears, collection is blocked by platform permissions;
+root inside a container is not sufficient by itself. Ask the platform
+administrator about supported profiling access. If access cannot be granted,
+continue with Nsight Systems durations and generated TTGIR/PTX. Do not treat a
+failed counter capture as an occupancy or bandwidth measurement, and stop the
+application manually if it continues after the profiling error.
 
 ## Testing
 
@@ -1212,6 +1497,41 @@ Prefer `CHECK-LABEL`, `CHECK-NEXT`, bounded `CHECK`, and `CHECK-DAG` patterns to
 fragile `CHECK-SAME` assertions when operations are intentionally printed on
 separate lines. Tests should verify semantics and types rather than local SSA
 names.
+
+### Host-ABI regression tests
+
+Keep positive v2 begin/bind/commit checks paired with an explicit
+`launch-abi=2` in the command that produces their host IR. Include continued
+`RUN` lines when editing test commands. V3 emits one launch call per source
+launch, not one replacement for each old begin/bind/commit call.
+
+The dedicated v3 test should cover:
+
+- omitted `launch-abi` selecting v3;
+- explicit v3 through the pipeline and standalone lowering;
+- explicit v2 compatibility;
+- absence of generated v2 begin/bind/commit calls in v3 output;
+- request fields, scalar kinds/seeds, and multi-result ordering;
+- identical device TTIR/JSON across host ABI selections where expected; and
+- unsupported host triples and invalid ABI selections.
+
+Keep checks for `fnacc.launch` IR, data transfers, release, and synchronization
+operations unchanged unless their actual semantics change. V2 matmul argument
+checks cannot be migrated by merely renaming the callee: v3 passes a request
+pointer, and the corresponding request stores must be checked instead.
+
+Run both FnACC test directories:
+
+```sh
+"$LLVM_BUILD/bin/llvm-lit" -sv \
+  /path/to/llvm-project/flang/test/FNACC \
+  /path/to/llvm-project/flang/test/Lower/FNACC
+```
+
+Files ending in `.before-v3-default`, `.before-v2-pin`, or `.bak` are editor
+backups, not normal `.f90`/`.mlir` lit tests. Review changes and remove backups
+before committing. A switch in defaults does not establish that every legacy
+test has been migrated; run the suite and inspect remaining failures.
 
 ### Reduction validation executable
 
@@ -1323,7 +1643,7 @@ matching one apparent FIR spelling is too fragile.
 2. Prove bounds, extents, access ranks/layouts, types, side-effect rules, and
    scalar classification.
 3. Construct the backend-neutral schedule and public ABI.
-4. Add runtime binding when the existing variadic launcher cannot represent
+4. Add runtime binding when the host request/binding interfaces cannot represent
    the pattern.
 5. Implement backend emission and `querySupport` checks.
 6. Emit and validate JSON metadata.
@@ -1369,7 +1689,7 @@ Update these together:
 
 - runtime-call creation in `FNACCLowerToRuntime.cpp`;
 - exported runtime function signatures;
-- JSON parameter roles and types;
+- JSON parameter roles and types when the device contract also changes;
 - driver image/ABI validation;
 - compatibility aliases or a schema/ABI version; and
 - MLIR lowering and executable integration tests.
@@ -1471,6 +1791,25 @@ through a host-temporary launch. Establish storage with `enter data`, `create`,
 `update device`, or `pack(...:device)` before asserting presence or updating
 the host.
 
+### `data_delete requires an active ENTER DATA region`
+
+A cached allocation is not proof of an active ownership frame: `update device`
+can create a cache entry even if the intended `enter data` never executed.
+Do not use `exit data copyout(...)` solely to fetch results if a later procedure
+will perform `exit data delete(...)`; the first exit already ends the frame.
+Use `update host(...)` for the intermediate fetch and one final region exit.
+
+An earlier frontend bug omitted standalone FnACC directives from the PFT lexical
+successor chain. In particular, `enter data create(...)` after an allocation
+error check containing `STOP` could be skipped. The fix classifies
+`FnACCStandaloneConstruct` as an executable directive in `PFTBuilder.h`.
+Rebuild the frontend and affected Fortran objects; moving the directive to a
+different procedure is a workaround, not the intended requirement. Verify the
+runtime enter/create calls in lowered FIR when diagnosing an old build.
+
+This specific fix does not establish that every unstructured control-flow corner
+case is supported; keep the separate termination-shape diagnostics below.
+
 ### Data-region ownership errors
 
 `copyout` and `delete` on `exit data` refer to the innermost active frame. Make
@@ -1536,8 +1875,11 @@ grid, tile, subgroup/block size, accelerator target, and image metadata.
   one executable or loading an image through the wrong runtime is unsupported.
 - Mixed code-generation backends or accelerator targets in one device module
   are unsupported.
-- The runtime owns one stream per CUDA or HIP context and serializes public
-  entry through a process-wide mutex.
+- The runtime owns one stream per CUDA or HIP context and serializes operations
+  within each context; initialization/cleanup also use shared registry/lifetime
+  coordination.
+- Host ABI v3 currently requires an explicit supported 64-bit x86_64 or aarch64
+  target triple. V2 remains the explicit compatibility path.
 - The HIP path depends on revision-compatible Triton, LLVM, ROCm device
   libraries, and `ld.lld`; AMD lowering pass names may require the documented
   environment overrides for a particular Triton revision.
